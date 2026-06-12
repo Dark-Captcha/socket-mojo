@@ -145,3 +145,189 @@ def resolve(host: String) raises -> List[IpAddress]:
         node = _read_u64_at_addr(node, 40)  # ai_next
     _ = external_call["freeaddrinfo", NoneType](UInt(Int(head)))
     return out^
+
+
+# --- Ring-driven resolver (RFC 1035 over the io_uring engine) -----------
+#
+# The sans-io codec lives in socket/dnswire.mojo; this drives it: UDP
+# with a deadline and one retry (fresh transaction id each attempt),
+# then TCP fallback when the server truncates. Uses a private Ring so
+# its completions never interleave with a caller's.
+
+from socket._libc import (
+    SOCK_DGRAM,
+    close as _libc_close,
+    connect as _libc_connect,
+    errno as _errno,
+    errno_message as _errno_message,
+    socket as _libc_socket,
+    write_sockaddr as _write_sockaddr,
+    SOCKADDR_STORAGE_SIZE as _SS_SIZE,
+)
+from socket.addr import SocketAddr
+from socket.dnswire import (
+    QTYPE_A,
+    dns_build_query,
+    dns_parse_response,
+)
+from socket.ring import KIND_RECV, KIND_SEND, Completion, Ring
+
+
+def _random_txid() raises -> UInt16:
+    # transaction ids must be unpredictable (spoofing resistance)
+    var b = InlineArray[UInt8, 2](fill=0)
+    var n = external_call["getrandom", Int](b.unsafe_ptr(), 2, UInt32(0))
+    if n != 2:
+        raise Error("socket.dns: getrandom failed")
+    return (UInt16(b[0]) << 8) | UInt16(b[1])
+
+
+def _connected_socket(server: SocketAddr, socktype: Int32) raises -> Int32:
+    var family = Int32(AF_INET6 if server.ip.is_v6 else AF_INET)
+    var fd = _libc_socket(family, socktype, Int32(0))
+    if fd < 0:
+        raise Error("socket.dns: socket() " + _errno_message(_errno()))
+    var sa = InlineArray[UInt8, _SS_SIZE](fill=0)
+    var alen = _write_sockaddr(
+        sa.unsafe_ptr(), server.ip.is_v6, server.ip.octets, server.port
+    )
+    # UDP connect is local bookkeeping; TCP connect through the ring
+    # would also work, but a blocking loopback/LAN connect keeps the
+    # resolver's completion handling single-purpose.
+    if _libc_connect(fd, sa.unsafe_ptr(), alen) != 0:
+        var msg = _errno_message(_errno())
+        _ = _libc_close(fd)
+        raise Error("socket.dns: connect() " + msg)
+    return fd
+
+
+def _await_recv(mut ring: Ring) raises -> Completion:
+    """Drives the private ring until the recv completes; send acks and
+    timeout partners are validated and dropped."""
+    while True:
+        _ = ring.wait(min_complete=1)
+        while True:
+            var c = ring.next_completion()
+            if not c:
+                break
+            var done = c.take()
+            if done.kind == KIND_RECV:
+                return done^
+            if done.kind == KIND_SEND:
+                done.ok()
+            # timeout partners and close acks: nothing to check
+
+
+def _query_udp(
+    server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
+) raises -> List[UInt8]:
+    var ring = Ring(16)
+    var fd = _connected_socket(server, Int32(SOCK_DGRAM))
+    _ = ring.send_copy(fd, query)
+    _ = ring.recv_with_timeout(fd, 2048, Int64(timeout_ms) * 1_000_000)
+    var got = _await_recv(ring)
+    _ = ring.close_fd(fd)
+    _ = ring.wait(min_complete=1)
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        _ = c.take()
+    if got.res == -125:  # ECANCELED: the deadline fired first
+        raise Error("socket.dns: query timed out")
+    got.ok()
+    return got.take_buffer()
+
+
+def _query_tcp(
+    server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
+) raises -> List[UInt8]:
+    var ring = Ring(16)
+    var fd = _connected_socket(server, Int32(SOCK_STREAM))
+    # RFC 1035 4.2.2: two-byte big-endian length prefix
+    var framed = List[UInt8](capacity=len(query) + 2)
+    framed.append(UInt8(len(query) >> 8))
+    framed.append(UInt8(len(query) & 0xFF))
+    framed.extend(query)
+    _ = ring.send(fd, framed^)
+    var acc = List[UInt8]()
+    var want = -1
+    var deadline_each = Int64(timeout_ms) * 1_000_000
+    while want < 0 or len(acc) < want + 2:
+        _ = ring.recv_with_timeout(fd, 4096, deadline_each)
+        var got = _await_recv(ring)
+        if got.res == -125:
+            raise Error("socket.dns: tcp query timed out")
+        got.ok()
+        if got.res == 0:
+            raise Error("socket.dns: tcp connection closed early")
+        var chunk = got.take_buffer()
+        acc.extend(Span(chunk))
+        if want < 0 and len(acc) >= 2:
+            want = (Int(acc[0]) << 8) | Int(acc[1])
+    _ = ring.close_fd(fd)
+    _ = ring.wait(min_complete=1)
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        _ = c.take()
+    var body = List[UInt8](capacity=want)
+    for i in range(want):
+        body.append(acc[2 + i])
+    return body^
+
+
+def resolve_dns(
+    host: String,
+    *,
+    server: SocketAddr,
+    qtype: UInt16 = QTYPE_A,
+    timeout_ms: Int = 2000,
+    retries: Int = 2,
+) raises -> List[IpAddress]:
+    """Resolves `host` against an explicit DNS server through the
+    io_uring engine: UDP with per-attempt deadline and fresh
+    transaction ids, TCP fallback on truncation. NXDOMAIN and other
+    server errors raise; an empty answer returns an empty list.
+    (resolve(), above, remains the system-configured getaddrinfo
+    path.)"""
+    try:
+        var literal = parse_ip(host)
+        var out = List[IpAddress]()
+        out.append(literal)
+        return out^
+    except:
+        pass
+    for attempt in range(retries):
+        var txid = _random_txid()
+        var query = dns_build_query(txid, host, qtype)
+        var raw: List[UInt8]
+        try:
+            raw = _query_udp(server, Span(query), timeout_ms)
+        except:
+            # timeout or transport failure: retry with a fresh txid
+            if attempt + 1 == retries:
+                raise Error(
+                    "socket.dns: no response from server for '"
+                    + host
+                    + "' after "
+                    + String(retries)
+                    + " attempts"
+                )
+            continue
+        var ans = dns_parse_response(Span(raw), txid, qtype)
+        if ans.truncated:
+            var raw2 = _query_tcp(server, Span(query), timeout_ms)
+            ans = dns_parse_response(Span(raw2), txid, qtype)
+        if ans.rcode != 0:
+            # server-reported errors are final, no retry
+            raise Error(
+                "socket.dns: server error rcode="
+                + String(Int(ans.rcode))
+                + " for '"
+                + host
+                + "'"
+            )
+        return ans.addresses.copy()
+    raise Error("socket.dns: unreachable")
