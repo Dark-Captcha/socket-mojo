@@ -31,7 +31,9 @@ def run() raises:
     var reply_pair = client.recv_from(2048)
     var pong_len = len(reply_pair[0])
     var got = String(unsafe_from_utf8=Span(reply_pair[0]))
-    check(got == String(unsafe_from_utf8=msg), "client got the echoed bytes back")
+    check(
+        got == String(unsafe_from_utf8=msg), "client got the echoed bytes back"
+    )
     print("test_udp: OK (" + String(pong_len) + " bytes round-tripped)")
 
 

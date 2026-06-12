@@ -92,11 +92,15 @@ def close(fd: Int32) -> Int32:
     return external_call["close", Int32](fd)
 
 
-def connect(fd: Int32, addr_ptr: UnsafePointer[UInt8, _], addr_len: UInt32) -> Int32:
+def connect(
+    fd: Int32, addr_ptr: UnsafePointer[UInt8, _], addr_len: UInt32
+) -> Int32:
     return external_call["connect", Int32](fd, addr_ptr, addr_len)
 
 
-def bind(fd: Int32, addr_ptr: UnsafePointer[UInt8, _], addr_len: UInt32) -> Int32:
+def bind(
+    fd: Int32, addr_ptr: UnsafePointer[UInt8, _], addr_len: UInt32
+) -> Int32:
     return external_call["bind", Int32](fd, addr_ptr, addr_len)
 
 
@@ -116,9 +120,7 @@ def send(fd: Int32, buf: UnsafePointer[UInt8, _], n: Int, flags: Int32) -> Int:
     return external_call["send", Int](fd, buf, n, flags)
 
 
-def writev(
-    fd: Int32, iov_ptr: UnsafePointer[UInt8, _], iovcnt: Int32
-) -> Int:
+def writev(fd: Int32, iov_ptr: UnsafePointer[UInt8, _], iovcnt: Int32) -> Int:
     """Vectored write: a single syscall sending multiple non-contiguous
     buffers (one Linux `struct iovec` per buffer). The kernel
     concatenates them on the wire — the TLS layer uses this to send a
@@ -213,9 +215,7 @@ def setsockopt(
     val_ptr: UnsafePointer[UInt8, _],
     val_len: UInt32,
 ) -> Int32:
-    return external_call["setsockopt", Int32](
-        fd, level, name, val_ptr, val_len
-    )
+    return external_call["setsockopt", Int32](fd, level, name, val_ptr, val_len)
 
 
 def shutdown(fd: Int32, how: Int32) -> Int32:

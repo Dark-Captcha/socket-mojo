@@ -10,7 +10,9 @@ def run() raises:
     check(v4.octets[0] == 192 and v4.octets[3] == 42, "v4 octets")
     check(v4.to_string() == "192.168.1.42", "v4 to_string")
     check(IpAddress.loopback_v4().is_loopback(), "127.0.0.1 is loopback")
-    check(IpAddress.v4(8, 8, 8, 8).is_loopback() == False, "8.8.8.8 not loopback")
+    check(
+        IpAddress.v4(8, 8, 8, 8).is_loopback() == False, "8.8.8.8 not loopback"
+    )
 
     var caught = False
     try:
@@ -40,8 +42,13 @@ def run() raises:
 
     # IPv4-mapped IPv6 with embedded v4 tail
     var mapped = parse_ipv6("::ffff:192.0.2.128")
-    check(mapped.octets[10] == 0xFF and mapped.octets[11] == 0xFF, "v4-mapped marker")
-    check(mapped.octets[12] == 192 and mapped.octets[15] == 128, "v4-mapped tail")
+    check(
+        mapped.octets[10] == 0xFF and mapped.octets[11] == 0xFF,
+        "v4-mapped marker",
+    )
+    check(
+        mapped.octets[12] == 192 and mapped.octets[15] == 128, "v4-mapped tail"
+    )
 
     # SocketAddr parsing — IPv4
     var sa = SocketAddr.parse("127.0.0.1:8080")

@@ -97,7 +97,9 @@ struct TcpSocket(Movable):
                 last_err = "socket.tcp: socket(2) " + errno_message(errno())
                 continue
             var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-            var alen = write_sockaddr(sa.unsafe_ptr(), ip.is_v6, ip.octets, port)
+            var alen = write_sockaddr(
+                sa.unsafe_ptr(), ip.is_v6, ip.octets, port
+            )
             # The kernel-default connect timeout can be many minutes; we
             # set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the syscall
             # itself respects the deadline.
@@ -159,7 +161,9 @@ struct TcpSocket(Movable):
                 continue
             raise Error("socket.tcp: recv() " + errno_message(e))
 
-    def read_into(mut self, mut buf: List[UInt8], *, offset: Int = 0) raises -> Int:
+    def read_into(
+        mut self, mut buf: List[UInt8], *, offset: Int = 0
+    ) raises -> Int:
         """Read directly into `buf` starting at `offset` (one syscall,
         zero allocation). Caller pre-sizes `buf`. Returns bytes read
         (0 = EOF). Used by tls-mojo and http-mojo to avoid the per-
@@ -205,7 +209,9 @@ struct TcpSocket(Movable):
                 raise Error("socket.tcp: recv() " + errno_message(e))
         return out^
 
-    def write_vectored(mut self, buffers: List[Span[UInt8, MutAnyOrigin]]) raises:
+    def write_vectored(
+        mut self, buffers: List[Span[UInt8, MutAnyOrigin]]
+    ) raises:
         """Send multiple buffers in ONE syscall via writev(2). On
         loopback this skips an extra kernel-mode crossing per buffer;
         on the wire it lets the kernel coalesce into a single TCP
@@ -265,7 +271,9 @@ struct TcpSocket(Movable):
             UInt32(4),
         )
         if rv != 0:
-            raise Error("socket.tcp: setsockopt(SO_RCVBUF) " + errno_message(errno()))
+            raise Error(
+                "socket.tcp: setsockopt(SO_RCVBUF) " + errno_message(errno())
+            )
 
     def set_send_buffer(mut self, bytes: Int) raises:
         var v = Int32(bytes)
@@ -277,7 +285,9 @@ struct TcpSocket(Movable):
             UInt32(4),
         )
         if rv != 0:
-            raise Error("socket.tcp: setsockopt(SO_SNDBUF) " + errno_message(errno()))
+            raise Error(
+                "socket.tcp: setsockopt(SO_SNDBUF) " + errno_message(errno())
+            )
 
     def set_read_timeout(mut self, seconds: Float64) raises:
         _apply_one_timeout(self.fd, SO_RCVTIMEO, seconds)
@@ -295,7 +305,9 @@ struct TcpSocket(Movable):
             UInt32(4),
         )
         if rv != 0:
-            raise Error("socket.tcp: setsockopt(TCP_NODELAY) " + errno_message(errno()))
+            raise Error(
+                "socket.tcp: setsockopt(TCP_NODELAY) " + errno_message(errno())
+            )
 
     def set_keepalive(mut self, enabled: Bool) raises:
         var flag = Int32(1) if enabled else Int32(0)

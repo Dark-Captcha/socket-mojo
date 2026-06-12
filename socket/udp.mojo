@@ -95,9 +95,7 @@ struct UdpSocket(Movable):
         if rv != 0:
             raise Error("socket.udp: connect(2) " + errno_message(errno()))
 
-    def send_to(
-        mut self, data: Span[UInt8, _], peer: SocketAddr
-    ) raises -> Int:
+    def send_to(mut self, data: Span[UInt8, _], peer: SocketAddr) raises -> Int:
         """Send one datagram. Returns the number of bytes the kernel
         accepted (almost always == len(data); UDP doesn't fragment in
         userland)."""
@@ -106,7 +104,12 @@ struct UdpSocket(Movable):
             sa.unsafe_ptr(), peer.ip.is_v6, peer.ip.octets, peer.port
         )
         var n = sendto(
-            self.fd, data.unsafe_ptr(), len(data), Int32(0), sa.unsafe_ptr(), alen
+            self.fd,
+            data.unsafe_ptr(),
+            len(data),
+            Int32(0),
+            sa.unsafe_ptr(),
+            alen,
         )
         if n < 0:
             raise Error("socket.udp: sendto(2) " + errno_message(errno()))

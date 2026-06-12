@@ -160,7 +160,7 @@ def parse_ipv6(text: String) raises -> IpAddress:
         else:
             i += 1
     # Split into head and tail around '::' (or the whole string if none).
-    var head = String("")
+    var head: String
     var tail = String("")
     if dcolon >= 0:
         head = String(text[byte=0:dcolon])
@@ -202,10 +202,14 @@ def parse_ipv6(text: String) raises -> IpAddress:
     var total = len(head_groups) + len(tail_groups) + v4_groups
     if dcolon < 0:
         if total != 8:
-            raise Error("socket.addr: IPv6 must have 8 groups when no '::' present")
+            raise Error(
+                "socket.addr: IPv6 must have 8 groups when no '::' present"
+            )
     else:
         if total > 8:
-            raise Error("socket.addr: '::' compresses zero or more groups, but already 8 present")
+            raise Error(
+                "socket.addr: '::' compresses zero or more groups, but already 8 present"
+            )
     var zero_groups = 8 - total
     var octets = InlineArray[UInt8, 16](fill=0)
     var pos = 0
@@ -266,7 +270,7 @@ struct SocketAddr(Copyable, ImplicitlyCopyable, Movable):
             var rbracket = text.find("]")
             if rbracket < 0:
                 raise Error("socket.addr: missing ']' in '[v6]:port'")
-            var ip = parse_ipv6(String(text[byte = 1:rbracket]))
+            var ip = parse_ipv6(String(text[byte=1:rbracket]))
             if rbracket + 1 >= len(tb) or tb[rbracket + 1] != UInt8(ord(":")):
                 raise Error("socket.addr: missing ':port' after ']'")
             var port = _parse_port(String(text[byte = rbracket + 2 : len(tb)]))

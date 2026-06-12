@@ -120,7 +120,9 @@ struct Poller(Movable):
     def open() raises -> Poller:
         var fd = epoll_create1(Int32(0))
         if fd < 0:
-            raise Error("socket.poller: epoll_create1 " + errno_message(errno()))
+            raise Error(
+                "socket.poller: epoll_create1 " + errno_message(errno())
+            )
         return Poller(fd)
 
     def _ctl(
@@ -200,11 +202,11 @@ struct Poller(Movable):
         # epoll_ctl(EPOLL_CTL_DEL) ignores the event argument; pass a
         # zeroed buffer.
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
-        var rv = epoll_ctl(
-            self.epfd, Int32(EPOLL_CTL_DEL), fd, ev.unsafe_ptr()
-        )
+        var rv = epoll_ctl(self.epfd, Int32(EPOLL_CTL_DEL), fd, ev.unsafe_ptr())
         if rv != 0:
-            raise Error("socket.poller: epoll_ctl(DEL) " + errno_message(errno()))
+            raise Error(
+                "socket.poller: epoll_ctl(DEL) " + errno_message(errno())
+            )
 
     def wait(
         mut self, *, max_events: Int = 64, timeout_ms: Int = -1

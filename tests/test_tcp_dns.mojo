@@ -7,7 +7,9 @@ from tests.helpers import check
 
 
 def run() raises:
-    var sock = TcpSocket.connect("localhost", UInt16(19502), timeout_seconds=2.0)
+    var sock = TcpSocket.connect(
+        "localhost", UInt16(19502), timeout_seconds=2.0
+    )
     var msg = "hostname resolution works".as_bytes()
     sock.write(msg)
     var got = sock.read_exact(len(msg))
