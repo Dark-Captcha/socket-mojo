@@ -1,0 +1,11 @@
+# pixi environments
+.pixi/
+*.egg-info
+# mojo build artifacts
+*.mojopkg
+*.mojoc
+# scratch
+.probe/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
