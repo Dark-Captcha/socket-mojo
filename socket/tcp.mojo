@@ -16,13 +16,17 @@ from socket._libc import (
     AF_INET,
     AF_INET6,
     IPPROTO_TCP_LEVEL,
+    MSG_NOSIGNAL,
+    MSG_WAITALL,
     SHUT_RDWR,
     SOCK_STREAM,
     SOCKADDR_STORAGE_SIZE,
     SOL_SOCKET,
     SO_KEEPALIVE,
+    SO_RCVBUF,
     SO_RCVTIMEO,
     SO_REUSEADDR,
+    SO_SNDBUF,
     SO_SNDTIMEO,
     TCP_NODELAY,
     accept,
@@ -33,12 +37,14 @@ from socket._libc import (
     errno_message,
     listen,
     read_sockaddr,
+    readv,
     recv,
     send,
     setsockopt,
     shutdown,
     socket as libc_socket,
     write_sockaddr,
+    writev,
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.dns import resolve
@@ -112,12 +118,16 @@ struct TcpSocket(Movable):
         raise Error(last_err)
 
     def write(mut self, data: Span[UInt8, _]) raises:
-        """Send `data` in full, looping over short writes. Raises if
-        the peer closes mid-stream (EPIPE / ECONNRESET)."""
+        """Send `data` in full, looping over short writes. MSG_NOSIGNAL
+        prevents the process from being killed by SIGPIPE when the peer
+        closes — we raise EPIPE instead, which the caller can handle."""
         var off = 0
         while off < len(data):
             var n = send(
-                self.fd, data.unsafe_ptr() + off, len(data) - off, Int32(0)
+                self.fd,
+                data.unsafe_ptr() + off,
+                len(data) - off,
+                Int32(MSG_NOSIGNAL),
             )
             if n > 0:
                 off += n
@@ -130,39 +140,144 @@ struct TcpSocket(Movable):
                 raise Error("socket.tcp: send() " + errno_message(e))
 
     def read(mut self, max_bytes: Int) raises -> List[UInt8]:
-        """Read up to `max_bytes`. May return fewer (including 0 if the
-        peer closed). Raises on a real I/O error."""
+        """Read up to `max_bytes`. May return fewer (0 means EOF).
+        Zero-copy: a single List is allocated at full size and resized
+        down to the actual byte count via the `length` mutator path."""
         if max_bytes <= 0:
             return List[UInt8]()
-        var buf = List[UInt8](length=max_bytes, fill=0)
+        var out = List[UInt8](length=max_bytes, fill=0)
         while True:
-            var n = recv(self.fd, buf.unsafe_ptr(), max_bytes, Int32(0))
+            var n = recv(self.fd, out.unsafe_ptr(), max_bytes, Int32(0))
             if n >= 0:
-                var out = List[UInt8](capacity=n)
-                for i in range(n):
-                    out.append(buf[i])
+                # Truncate the List in-place to the actual recv size.
+                # No copy: just shrink len; the trailing capacity is
+                # released when the List drops or grows past it.
+                out.resize(unsafe_uninit_length=n)
                 return out^
             var e = errno()
             if e == 4:  # EINTR
                 continue
             raise Error("socket.tcp: recv() " + errno_message(e))
 
+    def read_into(mut self, mut buf: List[UInt8], *, offset: Int = 0) raises -> Int:
+        """Read directly into `buf` starting at `offset` (one syscall,
+        zero allocation). Caller pre-sizes `buf`. Returns bytes read
+        (0 = EOF). Used by tls-mojo and http-mojo to avoid the per-
+        read allocation cost."""
+        var cap = len(buf) - offset
+        if cap <= 0:
+            return 0
+        while True:
+            var n = recv(self.fd, buf.unsafe_ptr() + offset, cap, Int32(0))
+            if n >= 0:
+                return n
+            var e = errno()
+            if e == 4:
+                continue
+            raise Error("socket.tcp: recv() " + errno_message(e))
+
     def read_exact(mut self, n: Int) raises -> List[UInt8]:
-        """Read exactly `n` bytes, looping until all received. Raises
-        if the peer closes before `n` bytes arrive."""
-        var out = List[UInt8](capacity=n)
-        while len(out) < n:
-            var chunk = self.read(n - len(out))
-            if len(chunk) == 0:
+        """Read exactly `n` bytes. Uses MSG_WAITALL so the kernel loops
+        internally — one syscall covers the whole read when the peer
+        cooperates, vs N round trips through userspace."""
+        if n <= 0:
+            return List[UInt8]()
+        var out = List[UInt8](length=n, fill=0)
+        var off = 0
+        while off < n:
+            var got = recv(
+                self.fd, out.unsafe_ptr() + off, n - off, Int32(MSG_WAITALL)
+            )
+            if got > 0:
+                off += got
+            elif got == 0:
                 raise Error(
                     "socket.tcp: read_exact got "
-                    + String(len(out))
+                    + String(off)
                     + " of "
                     + String(n)
                     + " bytes before EOF"
                 )
-            out.extend(Span(chunk))
+            else:
+                var e = errno()
+                if e == 4:
+                    continue
+                raise Error("socket.tcp: recv() " + errno_message(e))
         return out^
+
+    def write_vectored(mut self, buffers: List[Span[UInt8, MutAnyOrigin]]) raises:
+        """Send multiple buffers in ONE syscall via writev(2). On
+        loopback this skips an extra kernel-mode crossing per buffer;
+        on the wire it lets the kernel coalesce into a single TCP
+        segment (no Nagle pingpong between header and body). TLS uses
+        this to emit `record_header || ciphertext || tag` in one shot.
+        """
+        # Build an iovec[] array. Linux `struct iovec` = (void*, size_t),
+        # 16 bytes per entry.
+        var n = len(buffers)
+        if n == 0:
+            return
+        var iov = List[UInt8](length=16 * n, fill=0)
+        var iov_ptr = iov.unsafe_ptr()
+        var total = 0
+        for i in range(n):
+            var b = buffers[i]
+            var base = UInt64(Int(b.unsafe_ptr()))
+            var sz = UInt64(len(b))
+            total += len(b)
+            for k in range(8):
+                iov_ptr[16 * i + k] = UInt8((base >> UInt64(8 * k)) & 0xFF)
+            for k in range(8):
+                iov_ptr[16 * i + 8 + k] = UInt8((sz >> UInt64(8 * k)) & 0xFF)
+        # Loop in case the kernel doesn't write everything (rare with
+        # writev on a healthy socket, but possible). We don't restart
+        # the iovec from the middle — instead we fall back to plain
+        # send() for the remainder. This is the same trick libcurl uses.
+        var sent = writev(self.fd, iov_ptr, Int32(n))
+        if sent < 0:
+            raise Error("socket.tcp: writev() " + errno_message(errno()))
+        if sent < total:
+            # Compose the unsent tail into a flat buffer and send normally.
+            var tail = List[UInt8](capacity=total - sent)
+            var skip = sent
+            for i in range(n):
+                var b = buffers[i]
+                if skip >= len(b):
+                    skip -= len(b)
+                    continue
+                if skip > 0:
+                    tail.extend(b[skip : len(b)])
+                    skip = 0
+                else:
+                    tail.extend(b)
+            self.write(tail)
+
+    def set_recv_buffer(mut self, bytes: Int) raises:
+        """Hint to the kernel about preferred recv buffer size. Linux
+        doubles whatever you pass; root can go past /proc/sys/net/core/
+        rmem_max."""
+        var v = Int32(bytes)
+        var rv = setsockopt(
+            self.fd,
+            Int32(SOL_SOCKET),
+            Int32(SO_RCVBUF),
+            UnsafePointer(to=v).bitcast[UInt8](),
+            UInt32(4),
+        )
+        if rv != 0:
+            raise Error("socket.tcp: setsockopt(SO_RCVBUF) " + errno_message(errno()))
+
+    def set_send_buffer(mut self, bytes: Int) raises:
+        var v = Int32(bytes)
+        var rv = setsockopt(
+            self.fd,
+            Int32(SOL_SOCKET),
+            Int32(SO_SNDBUF),
+            UnsafePointer(to=v).bitcast[UInt8](),
+            UInt32(4),
+        )
+        if rv != 0:
+            raise Error("socket.tcp: setsockopt(SO_SNDBUF) " + errno_message(errno()))
 
     def set_read_timeout(mut self, seconds: Float64) raises:
         _apply_one_timeout(self.fd, SO_RCVTIMEO, seconds)

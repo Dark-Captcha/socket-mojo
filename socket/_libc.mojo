@@ -28,12 +28,22 @@ comptime SO_RCVTIMEO = 20
 comptime SO_SNDTIMEO = 21
 comptime SO_KEEPALIVE = 9
 comptime SO_ERROR = 4
+comptime SO_RCVBUF = 8
+comptime SO_SNDBUF = 7
 comptime IPPROTO_TCP_LEVEL = 6
 comptime TCP_NODELAY = 1
+comptime TCP_CORK = 3
+comptime TCP_QUICKACK = 12
 
 comptime SHUT_RD = 0
 comptime SHUT_WR = 1
 comptime SHUT_RDWR = 2
+
+# send/recv flags
+comptime MSG_NOSIGNAL = 0x4000  # don't raise SIGPIPE when peer closes
+comptime MSG_WAITALL = 0x100  # block until full count received
+comptime MSG_DONTWAIT = 0x40  # non-blocking single call
+comptime MSG_PEEK = 0x2  # read without consuming
 
 # `struct sockaddr_in` is 16 bytes; `struct sockaddr_in6` is 28 bytes.
 # We always pass a 28-byte buffer to be safe — the kernel reads only as
@@ -79,6 +89,22 @@ def accept(
 
 def send(fd: Int32, buf: UnsafePointer[UInt8, _], n: Int, flags: Int32) -> Int:
     return external_call["send", Int](fd, buf, n, flags)
+
+
+def writev(
+    fd: Int32, iov_ptr: UnsafePointer[UInt8, _], iovcnt: Int32
+) -> Int:
+    """Vectored write: a single syscall sending multiple non-contiguous
+    buffers (one Linux `struct iovec` per buffer). The kernel
+    concatenates them on the wire — the TLS layer uses this to send a
+    record header + encrypted body in one go."""
+    return external_call["writev", Int](fd, iov_ptr, iovcnt)
+
+
+def readv(
+    fd: Int32, iov_ptr: UnsafePointer[UInt8, MutAnyOrigin], iovcnt: Int32
+) -> Int:
+    return external_call["readv", Int](fd, iov_ptr, iovcnt)
 
 
 def recv(
