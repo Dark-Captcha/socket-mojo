@@ -45,6 +45,31 @@ comptime MSG_WAITALL = 0x100  # block until full count received
 comptime MSG_DONTWAIT = 0x40  # non-blocking single call
 comptime MSG_PEEK = 0x2  # read without consuming
 
+# fcntl(2)
+comptime F_GETFL = 3
+comptime F_SETFL = 4
+comptime O_NONBLOCK = 0x800
+
+# epoll(7) — Linux only; the BSD equivalent (kqueue) is a separate backend.
+comptime EPOLL_CTL_ADD = 1
+comptime EPOLL_CTL_DEL = 2
+comptime EPOLL_CTL_MOD = 3
+
+comptime EPOLLIN = 0x001
+comptime EPOLLPRI = 0x002
+comptime EPOLLOUT = 0x004
+comptime EPOLLERR = 0x008
+comptime EPOLLHUP = 0x010
+comptime EPOLLRDHUP = 0x2000
+comptime EPOLLEXCLUSIVE = 0x10000000  # 1 << 28
+comptime EPOLLWAKEUP = 0x20000000  # 1 << 29
+comptime EPOLLONESHOT = 0x40000000  # 1 << 30
+comptime EPOLLET = 0x80000000  # 1 << 31
+
+# `struct epoll_event` is packed on x86-64: u32 events at offset 0, then
+# a `union epoll_data_t` (u64) at offset 4. Total size 12 bytes per event.
+comptime EPOLL_EVENT_SIZE = 12
+
 # `struct sockaddr_in` is 16 bytes; `struct sockaddr_in6` is 28 bytes.
 # We always pass a 28-byte buffer to be safe — the kernel reads only as
 # many bytes as the family demands.
@@ -99,6 +124,50 @@ def writev(
     concatenates them on the wire — the TLS layer uses this to send a
     record header + encrypted body in one go."""
     return external_call["writev", Int](fd, iov_ptr, iovcnt)
+
+
+def fcntl_get_flags(fd: Int32) -> Int32:
+    return external_call["fcntl", Int32](fd, Int32(F_GETFL), Int32(0))
+
+
+def fcntl_set_flags(fd: Int32, flags: Int32) -> Int32:
+    return external_call["fcntl", Int32](fd, Int32(F_SETFL), flags)
+
+
+def epoll_create1(flags: Int32) -> Int32:
+    return external_call["epoll_create1", Int32](flags)
+
+
+def epoll_ctl(
+    epfd: Int32, op: Int32, fd: Int32, event_ptr: UnsafePointer[UInt8, _]
+) -> Int32:
+    return external_call["epoll_ctl", Int32](epfd, op, fd, event_ptr)
+
+
+def epoll_wait(
+    epfd: Int32,
+    events_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    max_events: Int32,
+    timeout_ms: Int32,
+) -> Int32:
+    return external_call["epoll_wait", Int32](
+        epfd, events_ptr, max_events, timeout_ms
+    )
+
+
+def socketpair_unix(
+    out_pair: UnsafePointer[UInt8, MutAnyOrigin],
+) -> Int32:
+    """Create a pair of connected AF_UNIX SOCK_STREAM sockets. Used by
+    tests as a self-contained two-ended channel that does not need a
+    network port. `out_pair` is a 2-int buffer (8 bytes); the two fds
+    land in fd_pair[0] (sender) and fd_pair[1] (receiver)."""
+    return external_call["socketpair", Int32](
+        Int32(1),  # AF_UNIX
+        Int32(1),  # SOCK_STREAM
+        Int32(0),
+        out_pair,
+    )
 
 
 def readv(

@@ -8,6 +8,7 @@
 
 import tests.test_addr
 import tests.test_dns
+import tests.test_poller
 import tests.test_tcp
 import tests.test_tcp_dns
 import tests.test_udp
@@ -19,4 +20,5 @@ def main() raises:
     tests.test_udp.run()
     tests.test_tcp.run()
     tests.test_tcp_dns.run()
+    tests.test_poller.run()
     print("ALL SOCKET TESTS PASSED")
