@@ -30,14 +30,25 @@ from socket._libc import (
     read_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
+from socket.bufring import BufRing
 from socket.uring_sys import (
+    ACCEPT_MULTISHOT,
+    CQE_BUFFER_SHIFT,
+    CQE_F_BUFFER,
+    CQE_F_MORE,
+    IOSQE_BUFFER_SELECT,
+    IOSQE_IO_LINK,
     OP_ACCEPT,
+    OP_ASYNC_CANCEL,
     OP_CLOSE,
     OP_CONNECT,
+    OP_LINK_TIMEOUT,
     OP_NOP,
     OP_RECV,
     OP_SEND,
     OP_SHUTDOWN,
+    OP_TIMEOUT,
+    RECV_MULTISHOT,
     UringQueue,
 )
 
@@ -48,6 +59,10 @@ comptime KIND_RECV = UInt8(3)
 comptime KIND_SEND = UInt8(4)
 comptime KIND_CLOSE = UInt8(5)
 comptime KIND_SHUTDOWN = UInt8(6)
+comptime KIND_ACCEPT_MULTI = UInt8(7)
+comptime KIND_RECV_MULTI = UInt8(8)
+comptime KIND_TIMEOUT = UInt8(9)
+comptime KIND_CANCEL = UInt8(10)
 
 
 @always_inline
@@ -64,6 +79,14 @@ def _kind_name(kind: UInt8) -> String:
         return "close"
     if kind == KIND_SHUTDOWN:
         return "shutdown"
+    if kind == KIND_ACCEPT_MULTI:
+        return "accept-multishot"
+    if kind == KIND_RECV_MULTI:
+        return "recv-multishot"
+    if kind == KIND_TIMEOUT:
+        return "timeout"
+    if kind == KIND_CANCEL:
+        return "cancel"
     return "nop"
 
 
@@ -111,6 +134,10 @@ struct Completion(Movable):
     var fd: Int32  # the fd the op was submitted against
     var res: Int32
     var buf: List[UInt8]
+    # multishot extras: kernel-picked buffer id (or -1) and whether
+    # this op stays armed and will produce further completions
+    var bid: Int
+    var more: Bool
 
     def __init__(
         out self,
@@ -119,12 +146,16 @@ struct Completion(Movable):
         fd: Int32,
         res: Int32,
         var buf: List[UInt8],
+        bid: Int = -1,
+        more: Bool = False,
     ):
         self.op = op
         self.kind = kind
         self.fd = fd
         self.res = res
         self.buf = buf^
+        self.bid = bid
+        self.more = more
 
     def ok(self) raises:
         if self.res < 0:
@@ -159,12 +190,39 @@ struct Ring(Movable):
     var slots: List[_OpSlot]
     var free: List[UInt32]
     var inflight: Int
+    var bufs: Optional[BufRing]
 
     def __init__(out self, entries: Int = 256) raises:
         self.q = UringQueue(entries)
         self.slots = List[_OpSlot]()
         self.free = List[UInt32]()
         self.inflight = 0
+        self.bufs = None
+
+    def setup_buffers(
+        mut self, *, entries: Int = 256, buf_size: Int = 16384, bgid: UInt16 = 0
+    ) raises:
+        """Registers the provided-buffer pool multishot recv draws
+        from. 16 KiB default matches the TLS record ceiling."""
+        self.bufs = BufRing(self.q.fd, bgid, entries, buf_size)
+
+    def buffer_view(
+        mut self, bid: Int, length: Int
+    ) raises -> Span[UInt8, MutAnyOrigin]:
+        """Borrowed bytes of a multishot-recv completion's buffer.
+        Valid until recycle_buffer(bid)."""
+        if not self.bufs:
+            raise Error("socket.ring: no buffer pool registered")
+        var p: UnsafePointer[UInt8, MutAnyOrigin] = (
+            self.bufs.value().backing.unsafe_ptr()
+            + bid * self.bufs.value().buf_size
+        )
+        return Span(ptr=p, length=length)
+
+    def recycle_buffer(mut self, bid: Int) raises:
+        if not self.bufs:
+            raise Error("socket.ring: no buffer pool registered")
+        self.bufs[].recycle(bid)
 
     # --- slot management --------------------------------------------------
 
@@ -275,6 +333,111 @@ struct Ring(Movable):
         self.inflight += 1
         return OpId(ud)
 
+    def accept_multishot(mut self, listen_fd: Int32) raises -> OpId:
+        """One armed SQE that produces a completion per incoming
+        connection until it terminates (completion with more=False).
+        Peer addresses are not collected on this path — fetch them via
+        getpeername if a protocol needs them."""
+        self._room()
+        var idx = self._alloc(KIND_ACCEPT_MULTI, listen_fd, List[UInt8]())
+        var ud = self._user_data(idx, KIND_ACCEPT_MULTI)
+        self.q.push_sqe(
+            OP_ACCEPT, listen_fd, 0, 0, 0, 0, ud, ioprio=ACCEPT_MULTISHOT
+        )
+        self.inflight += 1
+        return OpId(ud)
+
+    def recv_multishot(mut self, fd: Int32) raises -> OpId:
+        """One armed SQE that produces a buffer-carrying completion per
+        arriving chunk, drawing from the registered pool. Each
+        completion's bytes are read with buffer_view(bid, res) and MUST
+        be recycled with recycle_buffer(bid). res == 0 means peer EOF;
+        -ENOBUFS means the pool starved (recycle faster or grow it)."""
+        if not self.bufs:
+            raise Error("socket.ring: setup_buffers() first")
+        self._room()
+        var idx = self._alloc(KIND_RECV_MULTI, fd, List[UInt8]())
+        var ud = self._user_data(idx, KIND_RECV_MULTI)
+        self.q.push_sqe(
+            OP_RECV,
+            fd,
+            0,
+            0,
+            0,
+            0,
+            ud,
+            sqe_flags=IOSQE_BUFFER_SELECT,
+            ioprio=RECV_MULTISHOT,
+            buf_group=self.bufs.value().bgid,
+        )
+        self.inflight += 1
+        return OpId(ud)
+
+    def timeout(mut self, nanoseconds: Int64) raises -> OpId:
+        """A standalone timer: completes with res == -ETIME (-62) when
+        it fires, -ECANCELED if cancelled."""
+        self._room()
+        # __kernel_timespec { i64 sec, i64 nsec } — slot-owned
+        var ts = List[UInt8](length=16, fill=0)
+        ts.unsafe_ptr().bitcast[Int64]()[0] = nanoseconds // 1_000_000_000
+        (ts.unsafe_ptr() + 8).bitcast[Int64]()[0] = nanoseconds % 1_000_000_000
+        var ptr = UInt64(Int(ts.unsafe_ptr()))
+        var idx = self._alloc(KIND_TIMEOUT, -1, ts^)
+        var ud = self._user_data(idx, KIND_TIMEOUT)
+        self.q.push_sqe(OP_TIMEOUT, -1, ptr, 1, 0, 0, ud)
+        self.inflight += 1
+        return OpId(ud)
+
+    def recv_with_timeout(
+        mut self, fd: Int32, max_bytes: Int, nanoseconds: Int64
+    ) raises -> OpId:
+        """Single-shot recv that fails with -ECANCELED if no data
+        arrives within the deadline (linked timeout)."""
+        self._room()
+        if self.q.sq_space() < 2:
+            _ = self.q.enter(0)
+        var buf = List[UInt8](length=max_bytes + 16, fill=0)
+        # timespec rides in the same slot allocation, after the data
+        # (the kernel copies it at prep time, so submit-lifetime is
+        # enough — slot ownership gives us completion-lifetime anyway)
+        var data_ptr = UInt64(Int(buf.unsafe_ptr()))
+        var ts_ptr = UInt64(Int(buf.unsafe_ptr() + max_bytes))
+        (buf.unsafe_ptr() + max_bytes).bitcast[Int64]()[0] = (
+            nanoseconds // 1_000_000_000
+        )
+        (buf.unsafe_ptr() + max_bytes + 8).bitcast[Int64]()[0] = (
+            nanoseconds % 1_000_000_000
+        )
+        var idx = self._alloc(KIND_RECV, fd, buf^)
+        var ud = self._user_data(idx, KIND_RECV)
+        self.q.push_sqe(
+            OP_RECV,
+            fd,
+            data_ptr,
+            UInt32(max_bytes),
+            0,
+            0,
+            ud,
+            sqe_flags=IOSQE_IO_LINK,
+        )
+        # the linked timeout completes unidentified (kind NOP marker)
+        var tidx = self._alloc(KIND_TIMEOUT, -1, List[UInt8]())
+        var tud = self._user_data(tidx, KIND_TIMEOUT)
+        self.q.push_sqe(OP_LINK_TIMEOUT, -1, ts_ptr, 1, 0, 0, tud)
+        self.inflight += 2
+        return OpId(ud)
+
+    def cancel(mut self, target: OpId) raises -> OpId:
+        """Asks the kernel to cancel an in-flight op. The target then
+        completes with -ECANCELED (or finishes first); this op's own
+        completion is 0 on success, -ENOENT if nothing matched."""
+        self._room()
+        var idx = self._alloc(KIND_CANCEL, -1, List[UInt8]())
+        var ud = self._user_data(idx, KIND_CANCEL)
+        self.q.push_sqe(OP_ASYNC_CANCEL, -1, target.raw, 0, 0, 0, ud)
+        self.inflight += 1
+        return OpId(ud)
+
     # --- driving ------------------------------------------------------------
 
     def submit(mut self) raises -> Int:
@@ -288,7 +451,9 @@ struct Ring(Movable):
 
     def next_completion(mut self) raises -> Optional[Completion]:
         """Pops one completion if available; None when the CQ is
-        drained. Slot buffers move into the Completion here."""
+        drained. Slot buffers move into the Completion here. A
+        multishot completion with more=True leaves its op armed (the
+        slot stays live); the terminal one (more=False) releases it."""
         if not self.q.cqe_pending():
             return None
         var cqe = self.q.pop_cqe()
@@ -299,9 +464,24 @@ struct Ring(Movable):
             raise Error("socket.ring: completion for unknown slot")
         if self.slots[idx].gen != gen:
             raise Error("socket.ring: completion for stale generation")
+        var more = (cqe.flags & CQE_F_MORE) != 0
+        var bid = -1
+        if (cqe.flags & CQE_F_BUFFER) != 0:
+            bid = Int(cqe.flags >> UInt32(CQE_BUFFER_SHIFT))
+        var fd = self.slots[idx].fd
+        if more:
+            # armed multishot: the slot (and any owned memory) lives on
+            return Completion(
+                OpId(cqe.user_data),
+                kind,
+                fd,
+                cqe.res,
+                List[UInt8](),
+                bid,
+                True,
+            )
         var buf = List[UInt8]()
         swap(buf, self.slots[idx].buf)
-        var fd = self.slots[idx].fd
         # recycle the slot
         self.slots[idx].active = False
         self.slots[idx].gen += 1
@@ -312,4 +492,6 @@ struct Ring(Movable):
             buf.shrink(Int(cqe.res))
         if kind == KIND_RECV and cqe.res <= 0:
             buf.shrink(0)
-        return Completion(OpId(cqe.user_data), kind, fd, cqe.res, buf^)
+        return Completion(
+            OpId(cqe.user_data), kind, fd, cqe.res, buf^, bid, False
+        )

@@ -26,11 +26,15 @@ from socket._libc import (
 from socket.addr import IpAddress, SocketAddr
 from socket.ring import (
     KIND_ACCEPT,
+    KIND_ACCEPT_MULTI,
+    KIND_CANCEL,
     KIND_CLOSE,
     KIND_CONNECT,
     KIND_NOP,
     KIND_RECV,
+    KIND_RECV_MULTI,
     KIND_SEND,
+    KIND_TIMEOUT,
     Completion,
     Ring,
 )
@@ -204,9 +208,158 @@ def _test_external_echo() raises:
     print("  external echo via python peer: OK")
 
 
+def _test_multishot_and_buffers() raises:
+    # one armed accept + buffer-pool multishot recv, three clients
+    var ring = Ring(64)
+    ring.setup_buffers(entries=16, buf_size=512, bgid=3)
+    var port = UInt16(19613)
+    var lfd = _listening_socket(port)
+    var ms_accept = ring.accept_multishot(lfd)
+    _ = ring.submit()
+
+    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var clients = List[Int32]()
+    for _ in range(3):
+        var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+        _ = ring.connect(cfd, dest)
+        clients.append(cfd)
+    _ = ring.wait(min_complete=6)  # 3 connects + 3 multishot accepts
+
+    var accepted = List[Int32]()
+    var more_seen = 0
+    for _ in range(6):
+        var c = ring.next_completion()
+        check(Bool(c), "m1: completion present")
+        var done = c.take()
+        done.ok()
+        if done.kind == KIND_ACCEPT_MULTI:
+            check(done.op == ms_accept, "m1: multishot accept op id")
+            accepted.append(done.res)
+            if done.more:
+                more_seen += 1
+    check(len(accepted) == 3, "m1: three conns from one armed accept")
+    check(more_seen == 3, "m1: F_MORE on every multishot accept")
+
+    # multishot recv on the first conn: two sends -> two buffer CQEs
+    var ms_recv = ring.recv_multishot(accepted[0])
+    _ = ring.submit()
+    var m1 = String("first message").as_bytes()
+    _ = ring.send_copy(clients[0], m1)
+    _ = ring.wait(min_complete=2)
+    var m2 = String("second!").as_bytes()
+    _ = ring.send_copy(clients[0], m2)
+    _ = ring.wait(min_complete=2)
+
+    var msgs = 0
+    for _ in range(4):
+        var c = ring.next_completion()
+        check(Bool(c), "m1: send/recv completion present")
+        var done = c.take()
+        done.ok()
+        if done.kind == KIND_RECV_MULTI:
+            check(done.op == ms_recv, "m1: multishot recv op id")
+            check(done.bid >= 0, "m1: kernel picked a buffer")
+            check(done.more, "m1: recv stays armed")
+            var want = m1 if msgs == 0 else m2
+            var view = ring.buffer_view(done.bid, Int(done.res))
+            check(len(view) == len(want), "m1: recv chunk length")
+            var same = True
+            for i in range(len(view)):
+                if view[i] != want[i]:
+                    same = False
+            check(same, "m1: recv chunk bytes")
+            ring.recycle_buffer(done.bid)
+            msgs += 1
+    check(msgs == 2, "m1: two multishot recv chunks")
+
+    # cancel the armed recv; its terminal completion frees the slot
+    _ = ring.cancel(ms_recv)
+    _ = ring.wait(min_complete=2)
+    var canceled = False
+    for _ in range(2):
+        var c = ring.next_completion()
+        var done = c.take()
+        if done.kind == KIND_RECV_MULTI:
+            check(done.res == -125, "m1: canceled recv res ECANCELED")
+            check(not done.more, "m1: terminal completion")
+            canceled = True
+        else:
+            check(done.kind == KIND_CANCEL, "m1: cancel ack")
+            done.ok()
+    check(canceled, "m1: multishot recv canceled")
+
+    # cancel the armed accept too, then close everything
+    _ = ring.cancel(ms_accept)
+    _ = ring.wait(min_complete=2)
+    for _ in range(2):
+        var c = ring.next_completion()
+        _ = c.take()
+    for i in range(len(clients)):
+        _ = ring.close_fd(clients[i])
+    for i in range(len(accepted)):
+        _ = ring.close_fd(accepted[i])
+    _ = ring.close_fd(lfd)
+    _ = ring.wait(min_complete=7)
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        c.take().ok()
+    check(ring.inflight == 0, "m1: drained")
+    print("  multishot + buffer pool: OK")
+
+
+def _test_timers() raises:
+    var ring = Ring(32)
+    # standalone timer fires with -ETIME
+    _ = ring.timeout(30_000_000)  # 30 ms
+    _ = ring.wait(min_complete=1)
+    var c = ring.next_completion()
+    var done = c.take()
+    check(done.kind == KIND_TIMEOUT, "m1: timeout kind")
+    check(done.res == -62, "m1: timer fired ETIME")
+
+    # recv deadline on a silent connection
+    var port = UInt16(19614)
+    var lfd = _listening_socket(port)
+    var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+    _ = ring.connect(cfd, SocketAddr(IpAddress.v4(127, 0, 0, 1), port))
+    var acc = ring.accept(lfd)
+    _ = ring.wait(min_complete=2)
+    var afd = Int32(-1)
+    for _ in range(2):
+        var cc = ring.next_completion()
+        var dd = cc.take()
+        dd.ok()
+        if dd.op == acc:
+            afd = dd.res
+    _ = ring.recv_with_timeout(afd, 128, 40_000_000)  # nobody sends
+    _ = ring.wait(min_complete=2)
+    var got_cancel = False
+    for _ in range(2):
+        var cc = ring.next_completion()
+        var dd = cc.take()
+        if dd.kind == KIND_RECV:
+            check(dd.res == -125, "m1: recv deadline ECANCELED")
+            got_cancel = True
+    check(got_cancel, "m1: recv-with-timeout expired")
+    _ = ring.close_fd(cfd)
+    _ = ring.close_fd(afd)
+    _ = ring.close_fd(lfd)
+    _ = ring.wait(min_complete=3)
+    while True:
+        var cc = ring.next_completion()
+        if not cc:
+            break
+        cc.take().ok()
+    print("  timers + deadlines: OK")
+
+
 def run() raises:
     _test_nop_batch()
     _test_loopback_echo()
+    _test_multishot_and_buffers()
+    _test_timers()
     _test_external_echo()
     print("test_ring: OK")
 

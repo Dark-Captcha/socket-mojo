@@ -33,6 +33,7 @@ comptime OP_NOP = UInt8(0)
 comptime OP_TIMEOUT = UInt8(11)
 comptime OP_ACCEPT = UInt8(13)
 comptime OP_ASYNC_CANCEL = UInt8(14)
+comptime OP_LINK_TIMEOUT = UInt8(15)
 comptime OP_CONNECT = UInt8(16)
 comptime OP_CLOSE = UInt8(19)
 comptime OP_SEND = UInt8(26)
@@ -42,10 +43,37 @@ comptime OP_SHUTDOWN = UInt8(34)
 comptime SQE_SIZE = 64
 comptime CQE_SIZE = 16
 
+# sqe->flags bits
+comptime IOSQE_IO_LINK = UInt8(1 << 2)
+comptime IOSQE_BUFFER_SELECT = UInt8(1 << 5)
+
+# per-op ioprio bits
+comptime ACCEPT_MULTISHOT = UInt16(1 << 0)
+comptime RECV_MULTISHOT = UInt16(1 << 1)
+
+# cqe->flags bits
+comptime CQE_F_BUFFER = UInt32(1 << 0)
+comptime CQE_F_MORE = UInt32(1 << 1)
+comptime CQE_BUFFER_SHIFT = 16
+
+comptime REGISTER_PBUF_RING = 22
+comptime UNREGISTER_PBUF_RING = 23
+
 
 @always_inline
 def _syscall(n: Int, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int) -> Int:
     return external_call["syscall", Int](n, a, b, c, d, e, f)
+
+
+@always_inline
+def _mmap(
+    length: Int, prot: Int, flags: Int, fd: Int32, off: Int
+) -> UnsafePointer[UInt8, MutAnyOrigin]:
+    """The ONE mmap declaration in the process (a libc symbol may only
+    ever be declared with a single signature — see .probe/SYNTAX.md)."""
+    return external_call["mmap", UnsafePointer[UInt8, MutAnyOrigin]](
+        UInt(0), length, prot, flags, fd, off
+    )
 
 
 @always_inline
@@ -119,8 +147,7 @@ struct UringQueue(Movable):
         var cq_sz = self.cq_cqes_off + Int(cq_entries) * CQE_SIZE
         if cq_sz > self.ring_sz:
             self.ring_sz = cq_sz
-        self.ring = external_call["mmap", UnsafePointer[UInt8, MutAnyOrigin]](
-            UInt(0),
+        self.ring = _mmap(
             self.ring_sz,
             Int(_PROT_READ_WRITE),
             Int(_MAP_SHARED_POPULATE),
@@ -128,8 +155,7 @@ struct UringQueue(Movable):
             Int(_OFF_SQ_RING),
         )
         self.sqes_sz = Int(self.sq_entries) * SQE_SIZE
-        self.sqes = external_call["mmap", UnsafePointer[UInt8, MutAnyOrigin]](
-            UInt(0),
+        self.sqes = _mmap(
             self.sqes_sz,
             Int(_PROT_READ_WRITE),
             Int(_MAP_SHARED_POPULATE),
@@ -164,12 +190,18 @@ struct UringQueue(Movable):
         off_or_addr2: UInt64,
         op_flags: UInt32,
         user_data: UInt64,
+        *,
+        sqe_flags: UInt8 = 0,
+        ioprio: UInt16 = 0,
+        buf_group: UInt16 = 0,
     ):
         """Writes one SQE and publishes it with a release tail bump.
         Caller guarantees space (ring.mojo flushes when full). Every
         pointer in `addr`/`off_or_addr2` must stay valid until the
         operation's CQE is reaped — the op table in ring.mojo owns that
-        memory precisely for this reason."""
+        memory precisely for this reason. `ioprio` doubles as the
+        per-op flag word (multishot bits); `buf_group` selects a
+        provided-buffer ring when IOSQE_BUFFER_SELECT is set."""
         var tail_atomic = (self.ring + self.sq_tail_off).bitcast[
             Atomic[DType.uint32]
         ]()
@@ -179,12 +211,15 @@ struct UringQueue(Movable):
         for i in range(SQE_SIZE):
             s[i] = 0
         s[0] = opcode
+        s[1] = sqe_flags
+        (s + 2).bitcast[UInt16]()[0] = ioprio
         (s + 4).bitcast[Int32]()[0] = fd
         (s + 8).bitcast[UInt64]()[0] = off_or_addr2
         (s + 16).bitcast[UInt64]()[0] = addr
         (s + 24).bitcast[UInt32]()[0] = length
         (s + 28).bitcast[UInt32]()[0] = op_flags
         (s + 32).bitcast[UInt64]()[0] = user_data
+        (s + 40).bitcast[UInt16]()[0] = buf_group
         (self.ring + self.sq_array_off).bitcast[UInt32]()[idx] = UInt32(idx)
         _ = tail_atomic[].fetch_add(1)
         self.to_submit += 1
