@@ -49,12 +49,16 @@ def dns_build_query(
         out.append(0x00)  # AN/NS/AR counts
     var nb = name.as_bytes()
     var start = 0
+    var encoded = 0  # wire-encoded QNAME length so far (RFC 1035 §3.1: <= 255)
     for i in range(len(nb) + 1):
         var at_end = i == len(nb)
         if at_end or nb[i] == UInt8(ord(".")):
             var label_len = i - start
             if label_len == 0 or label_len > 63:
                 raise Error("socket.dnswire: bad label in '" + name + "'")
+            encoded += 1 + label_len  # length octet + label octets
+            if encoded > 254:  # +1 for the trailing root octet => 255 max
+                raise Error("socket.dnswire: name too long: '" + name + "'")
             out.append(UInt8(label_len))
             for j in range(start, i):
                 out.append(nb[j])
@@ -71,7 +75,8 @@ def _read_name(msg: Span[UInt8, _], start: Int) raises -> Tuple[String, Int]:
     """Decodes the (possibly compressed) name at `start`, following
     pointers with a hop bound. Returns (lower-cased dotted name,
     offset just past the name's bytes at the original position)."""
-    var name = String("")
+    # Accumulate into one byte buffer (no per-character String realloc).
+    var name = List[UInt8]()
     var off = start
     var next_off = -1  # set when the first pointer is taken
     var hops = 0
@@ -82,7 +87,7 @@ def _read_name(msg: Span[UInt8, _], start: Int) raises -> Tuple[String, Int]:
         if n == 0:
             if next_off < 0:
                 next_off = off + 1
-            return (name, next_off)
+            return (String(unsafe_from_utf8=name), next_off)
         if n >= 0xC0:
             if off + 1 >= len(msg):
                 raise Error("socket.dnswire: truncated pointer")
@@ -95,24 +100,42 @@ def _read_name(msg: Span[UInt8, _], start: Int) raises -> Tuple[String, Int]:
             continue
         if n > 63:
             raise Error("socket.dnswire: bad label length")
-        if name.byte_length() > 0:
-            name += "."
+        # Bound the label content against the message before reading it
+        # (the loop below reads up to msg[off + n]).
+        if off + 1 + n > len(msg):
+            raise Error("socket.dnswire: truncated label")
+        if len(name) > 0:
+            name.append(UInt8(ord(".")))
         for i in range(n):
             var c = msg[off + 1 + i]
             if c >= UInt8(ord("A")) and c <= UInt8(ord("Z")):
                 c += 32
-            name += String(chr(Int(c)))
-        if name.byte_length() > 255:
+            name.append(c)
+        if len(name) > 255:
             raise Error("socket.dnswire: name too long")
         off += 1 + n
 
 
+def _lower_ascii(s: String) -> String:
+    """Fold ASCII A-Z to a-z so a queried host compares equal to the
+    lowercased name _read_name produces (DNS names are ASCII)."""
+    var nb = s.as_bytes()
+    var out = List[UInt8](capacity=len(nb))
+    for i in range(len(nb)):
+        var c = nb[i]
+        if c >= UInt8(ord("A")) and c <= UInt8(ord("Z")):
+            c += 32
+        out.append(c)
+    return String(unsafe_from_utf8=out)
+
+
 def dns_parse_response(
-    msg: Span[UInt8, _], expect_txid: UInt16, qtype: UInt16
+    msg: Span[UInt8, _], expect_txid: UInt16, qtype: UInt16, expect_qname: String
 ) raises -> DnsAnswer:
     """Validates the header against the query and walks the answer
     section, following CNAMEs within the message. Raises on malformed
-    or mismatched packets; NXDOMAIN and friends come back via rcode."""
+    or mismatched packets (including a question that does not echo the
+    queried name/type/class); NXDOMAIN and friends come back via rcode."""
     if len(msg) < 12:
         raise Error("socket.dnswire: short response")
     var txid = (UInt16(msg[0]) << 8) | UInt16(msg[1])
@@ -128,10 +151,20 @@ def dns_parse_response(
     var ancount = (UInt16(msg[6]) << 8) | UInt16(msg[7])
     if qdcount != 1:
         raise Error("socket.dnswire: unexpected question count")
-    # question: capture the canonical qname, verify type/class echo
+    # question: capture the canonical qname, verify it echoes the queried
+    # host, and verify the qtype/qclass echo
     var q = _read_name(msg, 12)
     var current = q[0]
-    var off = q[1] + 4
+    if current != _lower_ascii(expect_qname):
+        raise Error("socket.dnswire: question name mismatch")
+    var qend = q[1]
+    if qend + 4 > len(msg):
+        raise Error("socket.dnswire: truncated question")
+    var rq_type = (UInt16(msg[qend]) << 8) | UInt16(msg[qend + 1])
+    var rq_class = (UInt16(msg[qend + 2]) << 8) | UInt16(msg[qend + 3])
+    if rq_type != qtype or rq_class != _CLASS_IN:
+        raise Error("socket.dnswire: question type/class mismatch")
+    var off = qend + 4
     # answers: follow the qname -> CNAME chain, collect matching types
     for _ in range(Int(ancount)):
         var owner_and_off = _read_name(msg, off)

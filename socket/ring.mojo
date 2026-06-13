@@ -189,6 +189,9 @@ struct Ring(Movable):
     var q: UringQueue
     var slots: List[_OpSlot]
     var free: List[UInt32]
+    # Count of submitted-but-not-yet-reaped ops. An invariant/debug counter
+    # (tests assert it returns to 0 on graceful drain); no control flow
+    # depends on it.
     var inflight: Int
     var bufs: Optional[BufRing]
 
@@ -213,6 +216,15 @@ struct Ring(Movable):
         Valid until recycle_buffer(bid)."""
         if not self.bufs:
             raise Error("socket.ring: no buffer pool registered")
+        # bid/length come straight from the kernel CQE; fail fast rather
+        # than form an out-of-bounds Span if anything ever desyncs.
+        if (
+            bid < 0
+            or bid >= self.bufs.value().entries
+            or length < 0
+            or length > self.bufs.value().buf_size
+        ):
+            raise Error("socket.ring: buffer_view bid/length out of range")
         var p: UnsafePointer[UInt8, MutAnyOrigin] = (
             self.bufs.value().backing.unsafe_ptr()
             + bid * self.bufs.value().buf_size
@@ -222,6 +234,8 @@ struct Ring(Movable):
     def recycle_buffer(mut self, bid: Int) raises:
         if not self.bufs:
             raise Error("socket.ring: no buffer pool registered")
+        if bid < 0 or bid >= self.bufs.value().entries:
+            raise Error("socket.ring: recycle_buffer bid out of range")
         self.bufs[].recycle(bid)
 
     # --- slot management --------------------------------------------------
@@ -292,7 +306,10 @@ struct Ring(Movable):
 
     def recv(mut self, fd: Int32, max_bytes: Int) raises -> OpId:
         self._room()
-        var buf = List[UInt8](length=max_bytes, fill=0)
+        # Uninitialized: the kernel fills it; a zero-fill would be thrown
+        # away on the next syscall.
+        var buf = List[UInt8](capacity=max_bytes)
+        buf.resize(unsafe_uninit_length=max_bytes)
         var ptr = UInt64(Int(buf.unsafe_ptr()))
         var idx = self._alloc(KIND_RECV, fd, buf^)
         var ud = self._user_data(idx, KIND_RECV)
@@ -349,10 +366,14 @@ struct Ring(Movable):
 
     def recv_multishot(mut self, fd: Int32) raises -> OpId:
         """One armed SQE that produces a buffer-carrying completion per
-        arriving chunk, drawing from the registered pool. Each
-        completion's bytes are read with buffer_view(bid, res) and MUST
-        be recycled with recycle_buffer(bid). res == 0 means peer EOF;
-        -ENOBUFS means the pool starved (recycle faster or grow it)."""
+        arriving chunk, drawing from the registered pool. ANY completion
+        with bid >= 0 — INCLUDING the terminal one (more == False) — owns
+        a pool buffer: read it with buffer_view(bid, res) and you MUST
+        recycle_buffer(bid) afterwards. A multishot can terminate WHILE
+        committing a buffer (res > 0, more == False) when the pool drains
+        or the CQ overflows; skipping recycle there leaks that buffer and
+        starves the pool toward -ENOBUFS. res == 0 means peer EOF (no
+        buffer, bid == -1); -ENOBUFS means the pool starved."""
         if not self.bufs:
             raise Error("socket.ring: setup_buffers() first")
         self._room()
@@ -391,12 +412,24 @@ struct Ring(Movable):
     def recv_with_timeout(
         mut self, fd: Int32, max_bytes: Int, nanoseconds: Int64
     ) raises -> OpId:
-        """Single-shot recv that fails with -ECANCELED if no data
-        arrives within the deadline (linked timeout)."""
+        """Recv bounded by a linked deadline: the recv fails with
+        -ECANCELED if no data arrives in time.
+
+        NOTE: this queues TWO operations and posts TWO completions — the
+        recv (KIND_RECV: bytes, or -ECANCELED on the deadline) AND its
+        linked timeout (KIND_TIMEOUT: -ETIME if it fired, -ECANCELED if
+        the recv finished first). Callers MUST reap BOTH completions to
+        release both slots and bring inflight back down by 2; reaping
+        only the returned KIND_RECV OpId leaks one slot and one inflight
+        count."""
         self._room()
         if self.q.sq_space() < 2:
             _ = self.q.enter(0)
-        var buf = List[UInt8](length=max_bytes + 16, fill=0)
+        # Data region [0, max_bytes) is kernel-written; the trailing
+        # 16-byte timespec is written explicitly below — so allocate
+        # uninitialized (no wasted zero-fill).
+        var buf = List[UInt8](capacity=max_bytes + 16)
+        buf.resize(unsafe_uninit_length=max_bytes + 16)
         # timespec rides in the same slot allocation, after the data
         # (the kernel copies it at prep time, so submit-lifetime is
         # enough — slot ownership gives us completion-lifetime anyway)
@@ -420,7 +453,9 @@ struct Ring(Movable):
             ud,
             sqe_flags=IOSQE_IO_LINK,
         )
-        # the linked timeout completes unidentified (kind NOP marker)
+        # The linked timeout posts its OWN KIND_TIMEOUT completion (-ETIME
+        # if it fired, -ECANCELED if the recv completed first); it is
+        # fully identified and must be reaped like any other completion.
         var tidx = self._alloc(KIND_TIMEOUT, -1, List[UInt8]())
         var tud = self._user_data(tidx, KIND_TIMEOUT)
         self.q.push_sqe(OP_LINK_TIMEOUT, -1, ts_ptr, 1, 0, 0, tud)

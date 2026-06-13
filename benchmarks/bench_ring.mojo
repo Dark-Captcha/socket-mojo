@@ -121,7 +121,7 @@ def _bench_ring_single(msg_size: Int, rounds: Int) raises -> Float64:
                 break
             var done = c.take()
             if done.kind == KIND_RECV_MULTI:
-                if not done.more or done.res <= 0:
+                if done.res <= 0:
                     continue
                 var view = ring.buffer_view(done.bid, Int(done.res))
                 if done.fd == afd:
@@ -156,6 +156,13 @@ def _bench_ring_fanout(
         _ = ring.recv_multishot(afds[i])
         _ = ring.recv_multishot(cfds[i])
     var msg = List[UInt8](length=msg_size, fill=0x42)
+    # O(1) server/client classification, built ONCE outside the timed
+    # region (the old per-completion linear scan was O(conns^2) and
+    # distorted the high-concurrency numbers).
+    var is_server_fd = Dict[Int32, Bool]()
+    for i in range(conns):
+        is_server_fd[afds[i]] = True
+        is_server_fd[cfds[i]] = False
     # prime one ping per connection
     for ci in range(conns):
         _ = ring.send_copy(cfds[ci], Span(msg))
@@ -170,15 +177,10 @@ def _bench_ring_fanout(
                 break
             var done = c.take()
             if done.kind == KIND_RECV_MULTI:
-                if not done.more or done.res <= 0:
+                if done.res <= 0:
                     continue
                 var view = ring.buffer_view(done.bid, Int(done.res))
-                # is this an "a" side (server) or "c" side (client) fd?
-                var is_server = False
-                for i in range(conns):
-                    if afds[i] == done.fd:
-                        is_server = True
-                if is_server:
+                if is_server_fd[done.fd]:
                     _ = ring.send_copy(done.fd, view)
                 else:
                     pings += 1

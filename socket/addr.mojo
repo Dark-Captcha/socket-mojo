@@ -79,12 +79,19 @@ struct IpAddress(Copyable, ImplicitlyCopyable, Movable):
 
     def to_string(self) -> String:
         if not self.is_v6:
-            var s = String("")
+            # Build the dotted-quad into one byte buffer (no per-segment
+            # String reallocation), matching the v6 branch below.
+            var out = List[UInt8](capacity=15)
             for i in range(4):
                 if i > 0:
-                    s += "."
-                s += String(Int(self.octets[i]))
-            return s^
+                    out.append(UInt8(ord(".")))
+                var v = Int(self.octets[i])
+                if v >= 100:
+                    out.append(UInt8(ord("0") + v // 100))
+                if v >= 10:
+                    out.append(UInt8(ord("0") + (v // 10) % 10))
+                out.append(UInt8(ord("0") + v % 10))
+            return String(unsafe_from_utf8=out)
         # IPv6: render as 8 groups of 16 bits in hex. No `::` compression
         # for now (purely cosmetic; the value is still uniquely encoded).
         var hexchars = "0123456789abcdef".as_bytes()
@@ -144,6 +151,36 @@ def _hex_nibble(c: UInt8) raises -> UInt8:
     raise Error("socket.addr: invalid hex digit in IPv6")
 
 
+def _parse_ipv6_segment(
+    seg: String, mut groups: List[UInt16], mut v4: InlineArray[UInt8, 4]
+) raises -> Bool:
+    """Parse a colon-separated segment into `groups`, claiming an embedded
+    IPv4 in its LAST piece (written into `v4`) if present. Returns True if
+    a v4 tail was found. Applies to BOTH the head (no `::`) and the tail
+    (after `::`), so `1:2:3:4:5:6:1.2.3.4` parses as well as `::ffff:1.2.3.4`.
+    """
+    if seg.byte_length() == 0:
+        return False
+    var pieces = List[String]()
+    for piece_str in seg.split(":"):
+        pieces.append(String(piece_str))
+    var has_v4 = False
+    var last = pieces[len(pieces) - 1]
+    if last.find(".") >= 0:
+        var v = parse_ipv4(last)
+        v4[0] = v.octets[0]
+        v4[1] = v.octets[1]
+        v4[2] = v.octets[2]
+        v4[3] = v.octets[3]
+        has_v4 = True
+        _ = pieces.pop()
+    for piece in pieces:
+        if piece.byte_length() == 0:
+            raise Error("socket.addr: empty IPv6 group")
+        groups.append(_parse_ipv6_group(piece))
+    return has_v4
+
+
 def parse_ipv6(text: String) raises -> IpAddress:
     """Parse an RFC 5952 IPv6 string. Supports `::` compression and the
     embedded-IPv4 tail (`::ffff:1.2.3.4`)."""
@@ -171,33 +208,20 @@ def parse_ipv6(text: String) raises -> IpAddress:
     # claims the last 32 bits.
     var head_groups = List[UInt16]()
     var tail_groups = List[UInt16]()
-    if head.byte_length() > 0:
-        for piece_str in head.split(":"):
-            var piece = String(piece_str)
-            if piece.byte_length() == 0:
-                raise Error("socket.addr: empty IPv6 group")
-            head_groups.append(_parse_ipv6_group(piece))
     var tail_v4_octets = InlineArray[UInt8, 4](fill=0)
-    var tail_has_v4 = False
-    if tail.byte_length() > 0:
-        var tail_parts = List[String]()
-        for piece_str in tail.split(":"):
-            tail_parts.append(String(piece_str))
-        if len(tail_parts) > 0:
-            var last = tail_parts[len(tail_parts) - 1]
-            if last.find(".") >= 0:
-                # Embedded IPv4 in the last group.
-                var v4 = parse_ipv4(last)
-                tail_v4_octets[0] = v4.octets[0]
-                tail_v4_octets[1] = v4.octets[1]
-                tail_v4_octets[2] = v4.octets[2]
-                tail_v4_octets[3] = v4.octets[3]
-                tail_has_v4 = True
-                _ = tail_parts.pop()
-        for piece in tail_parts:
-            if piece.byte_length() == 0:
-                raise Error("socket.addr: empty IPv6 group")
-            tail_groups.append(_parse_ipv6_group(piece))
+    var tail_has_v4: Bool
+    if dcolon < 0:
+        # Whole address is in `head`; an embedded IPv4 may be its last
+        # piece (the uncompressed `1:2:3:4:5:6:1.2.3.4` form).
+        tail_has_v4 = _parse_ipv6_segment(head, head_groups, tail_v4_octets)
+    else:
+        if head.byte_length() > 0:
+            for piece_str in head.split(":"):
+                var piece = String(piece_str)
+                if piece.byte_length() == 0:
+                    raise Error("socket.addr: empty IPv6 group")
+                head_groups.append(_parse_ipv6_group(piece))
+        tail_has_v4 = _parse_ipv6_segment(tail, tail_groups, tail_v4_octets)
     var v4_groups = 2 if tail_has_v4 else 0
     var total = len(head_groups) + len(tail_groups) + v4_groups
     if dcolon < 0:
@@ -206,9 +230,11 @@ def parse_ipv6(text: String) raises -> IpAddress:
                 "socket.addr: IPv6 must have 8 groups when no '::' present"
             )
     else:
-        if total > 8:
+        if total >= 8:
+            # '::' must compress at least one zero group (RFC 4291/5952);
+            # a full 8-group address with a '::' is invalid.
             raise Error(
-                "socket.addr: '::' compresses zero or more groups, but already 8 present"
+                "socket.addr: '::' must compress at least one zero group"
             )
     var zero_groups = 8 - total
     var octets = InlineArray[UInt8, 16](fill=0)
@@ -275,9 +301,14 @@ struct SocketAddr(Copyable, ImplicitlyCopyable, Movable):
                 raise Error("socket.addr: missing ':port' after ']'")
             var port = _parse_port(String(text[byte = rbracket + 2 : len(tb)]))
             return SocketAddr(ip, port)
-        var colon = text.rfind(":")
-        if colon < 0:
+        var first_colon = text.find(":")
+        if first_colon < 0:
             raise Error("socket.addr: missing ':port'")
+        # More than one colon and no brackets => ambiguous bare IPv6;
+        # require the '[v6]:port' form to attach a port to an IPv6 literal.
+        if text.find(":", first_colon + 1) >= 0:
+            raise Error("socket.addr: bracket IPv6 as '[v6]:port'")
+        var colon = first_colon
         var ip = parse_ip(String(text[byte=0:colon]))
         var port = _parse_port(String(text[byte = colon + 1 : len(tb)]))
         return SocketAddr(ip, port)
@@ -295,6 +326,10 @@ def _parse_port(text: String) raises -> UInt16:
     if text.byte_length() == 0:
         raise Error("socket.addr: empty port")
     var sb = text.as_bytes()
+    # Bound the length first so an overlong digit string surfaces the
+    # domain error here rather than Int()'s generic conversion failure.
+    if len(sb) > 5:
+        raise Error("socket.addr: port out of range 0..65535")
     for i in range(len(sb)):
         if sb[i] < UInt8(ord("0")) or sb[i] > UInt8(ord("9")):
             raise Error("socket.addr: non-digit in port")

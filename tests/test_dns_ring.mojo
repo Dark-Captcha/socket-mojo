@@ -88,7 +88,7 @@ def _test_parser_negatives() raises:
     var caught = False
     try:
         var short = List[UInt8](length=4, fill=0)
-        _ = dns_parse_response(Span(short), UInt16(0), QTYPE_A)
+        _ = dns_parse_response(Span(short), UInt16(0), QTYPE_A, String("x"))
     except:
         caught = True
     check(caught, "dns: short packet rejected")
@@ -98,7 +98,7 @@ def _test_parser_negatives() raises:
     try:
         var fake = List[UInt8](length=12, fill=0)
         fake[2] = 0x80  # QR=1
-        _ = dns_parse_response(Span(fake), UInt16(7), QTYPE_A)
+        _ = dns_parse_response(Span(fake), UInt16(7), QTYPE_A, String("x"))
     except:
         caught = True
     check(caught, "dns: txid mismatch rejected")
@@ -107,7 +107,7 @@ def _test_parser_negatives() raises:
     caught = False
     try:
         var fake2 = List[UInt8](length=12, fill=0)
-        _ = dns_parse_response(Span(fake2), UInt16(0), QTYPE_A)
+        _ = dns_parse_response(Span(fake2), UInt16(0), QTYPE_A, String("x"))
     except:
         caught = True
     check(caught, "dns: QR=0 rejected")
@@ -120,7 +120,7 @@ def _test_parser_negatives() raises:
         lp[5] = 0x01  # QDCOUNT=1
         lp[12] = 0xC0
         lp[13] = 0x0C  # pointer to offset 12 = itself
-        _ = dns_parse_response(Span(lp), UInt16(0), QTYPE_A)
+        _ = dns_parse_response(Span(lp), UInt16(0), QTYPE_A, String("x"))
     except:
         caught = True
     check(caught, "dns: pointer loop rejected")

@@ -14,13 +14,17 @@
 
 from std.atomic import Atomic
 from std.ffi import external_call
-from std.memory import UnsafePointer
+from std.memory import UnsafePointer, memset_zero
 
 comptime SYS_IO_URING_SETUP = 425
 comptime SYS_IO_URING_ENTER = 426
 comptime SYS_IO_URING_REGISTER = 427
 
 comptime ENTER_GETEVENTS = UInt32(1)
+
+# io_uring_params.features bit (offset 20). SINGLE_MMAP means the SQ and
+# CQ rings share one mapping — the layout this file assumes (Linux 5.4+).
+comptime FEAT_SINGLE_MMAP = UInt32(1 << 0)
 
 comptime _PROT_READ_WRITE = 3
 comptime _MAP_SHARED_POPULATE = 0x8001
@@ -141,8 +145,20 @@ struct UringQueue(Movable):
         self.cq_tail_off = Int(_u32_field(params, 84))
         var cq_mask_off = Int(_u32_field(params, 88))
         self.cq_cqes_off = Int(_u32_field(params, 100))
-        # FEAT_SINGLE_MMAP (universal on modern kernels): SQ and CQ
-        # share one mapping sized to the larger of the two.
+        # The single-mapping layout below (CQ offsets read from, and sized
+        # into, the SQ-ring mapping) is only valid when the kernel set
+        # IORING_FEAT_SINGLE_MMAP. Without it the CQ is a SEPARATE mapping
+        # and these offsets/reads would silently target the wrong region.
+        # A raising __init__ never runs __del__, so close the fd here.
+        var features = _u32_field(params, 20)
+        if (features & FEAT_SINGLE_MMAP) == 0:
+            _ = external_call["close", Int32](self.fd)
+            raise Error(
+                "socket.uring: kernel lacks IORING_FEAT_SINGLE_MMAP"
+                " (needs Linux 5.4+)"
+            )
+        # FEAT_SINGLE_MMAP: SQ and CQ share one mapping sized to the
+        # larger of the two.
         self.ring_sz = self.sq_array_off + Int(self.sq_entries) * 4
         var cq_sz = self.cq_cqes_off + Int(cq_entries) * CQE_SIZE
         if cq_sz > self.ring_sz:
@@ -154,6 +170,10 @@ struct UringQueue(Movable):
             self.fd,
             Int(_OFF_SQ_RING),
         )
+        # mmap signals failure with MAP_FAILED == (void*)-1, never NULL.
+        if Int(self.ring) == -1:
+            _ = external_call["close", Int32](self.fd)
+            raise Error("socket.uring: mmap SQ ring failed")
         self.sqes_sz = Int(self.sq_entries) * SQE_SIZE
         self.sqes = _mmap(
             self.sqes_sz,
@@ -162,6 +182,10 @@ struct UringQueue(Movable):
             self.fd,
             Int(_OFF_SQES),
         )
+        if Int(self.sqes) == -1:
+            _ = external_call["munmap", Int32](self.ring, self.ring_sz)
+            _ = external_call["close", Int32](self.fd)
+            raise Error("socket.uring: mmap SQEs failed")
         self.sq_mask = (self.ring + sq_mask_off).bitcast[UInt32]()[0]
         self.cq_mask = (self.ring + cq_mask_off).bitcast[UInt32]()[0]
         self.to_submit = 0
@@ -176,8 +200,9 @@ struct UringQueue(Movable):
     @always_inline
     def sq_space(self) -> UInt32:
         """SQEs that can still be queued before an enter is required.
-        Locally-queued count is exact because every enter() submits
-        the whole batch."""
+        Exact: to_submit always reflects exactly the published-but-not-
+        yet-consumed SQEs occupying ring slots (enter() decrements it by
+        what the kernel actually consumed)."""
         return self.sq_entries - self.to_submit
 
     @always_inline
@@ -208,8 +233,10 @@ struct UringQueue(Movable):
         var tail = tail_atomic[].load()
         var idx = Int(tail & self.sq_mask)
         var s = self.sqes + SQE_SIZE * idx
-        for i in range(SQE_SIZE):
-            s[i] = 0
+        # One vectorized clear of the whole 64-byte SQE (the field stores
+        # below overwrite ~42 of those bytes); cheaper than 64 scalar
+        # stores on this per-submission hot path.
+        memset_zero(s, SQE_SIZE)
         s[0] = opcode
         s[1] = sqe_flags
         (s + 2).bitcast[UInt16]()[0] = ioprio
@@ -221,24 +248,40 @@ struct UringQueue(Movable):
         (s + 32).bitcast[UInt64]()[0] = user_data
         (s + 40).bitcast[UInt16]()[0] = buf_group
         (self.ring + self.sq_array_off).bitcast[UInt32]()[idx] = UInt32(idx)
+        # Load-bearing: this publishes the SQE to the kernel. Mojo's Atomic
+        # defaults to SEQUENTIAL (seq_cst), so the SQE body stores above are
+        # ordered before this tail bump becomes visible (release). Do not
+        # weaken to relaxed without a separate release fence.
         _ = tail_atomic[].fetch_add(1)
         self.to_submit += 1
 
     def enter(mut self, min_complete: Int) raises -> Int:
-        """Submits everything queued and (optionally) waits for at
-        least `min_complete` completions. Returns SQEs consumed."""
+        """Submits everything queued and (optionally) waits for at least
+        `min_complete` completions. Returns the SQEs the kernel consumed.
+
+        to_submit is decremented ONLY by what the kernel reports consumed
+        and is left fully intact on an error return. On a CQ-overflow
+        backlog io_uring_enter returns -EBUSY having consumed zero SQEs;
+        preserving the count means the still-published SQEs are re-counted
+        and resubmitted on the next enter() instead of being stranded
+        (which would otherwise pin ring.mojo slots/buffers and leave
+        inflight permanently non-zero). Partial submits (rc < n) leave the
+        remainder counted so the next enter() carries them."""
         var n = Int(self.to_submit)
-        self.to_submit = 0
         var flags = Int(ENTER_GETEVENTS) if min_complete > 0 else 0
         var rc = _syscall(
             SYS_IO_URING_ENTER, Int(self.fd), n, min_complete, flags, 0, 0
         )
         if rc < 0:
+            # to_submit left intact: the published SQEs are still in the
+            # ring and will be re-counted on the next enter().
             raise Error(
                 "socket.uring: io_uring_enter failed (errno "
                 + String(-rc)
                 + ")"
             )
+        # The kernel may consume fewer than n; retire only those.
+        self.to_submit -= UInt32(rc)
         return rc
 
     @always_inline

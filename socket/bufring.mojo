@@ -47,7 +47,13 @@ struct BufRing(Movable):
         var pages = (self.ring_bytes + 4095) & ~4095
         # MAP_PRIVATE | MAP_ANONYMOUS
         self.ring_mem = _mmap(pages, 3, 0x22, Int32(-1), 0)
-        self.backing = List[UInt8](length=entries * buf_size, fill=0)
+        # mmap signals failure with MAP_FAILED == (void*)-1, never NULL.
+        if Int(self.ring_mem) == -1:
+            raise Error("socket.bufring: mmap ring failed")
+        # The kernel fills these buffers on recv; allocate uninitialized
+        # rather than paying a full zero-fill the kernel overwrites.
+        self.backing = List[UInt8](capacity=entries * buf_size)
+        self.backing.resize(unsafe_uninit_length=entries * buf_size)
         var bp = self.backing.unsafe_ptr()
         for b in range(entries):
             var e = self.ring_mem + 16 * b
@@ -104,8 +110,10 @@ struct BufRing(Movable):
         )
         return Span(ptr=p, length=length)
 
-    def recycle(mut self, bid: Int):
+    def recycle(mut self, bid: Int) raises:
         """Returns buffer `bid` to the kernel's pool."""
+        if bid < 0 or bid >= self.entries:
+            raise Error("socket.bufring: recycle bid out of range")
         var slot = Int(self.tail_local) & (self.entries - 1)
         var e = self.ring_mem + 16 * slot
         var bp = self.backing.unsafe_ptr()

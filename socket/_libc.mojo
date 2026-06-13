@@ -19,7 +19,6 @@ comptime AF_UNSPEC = 0
 comptime SOCK_STREAM = 1
 comptime SOCK_DGRAM = 2
 
-comptime IPPROTO_TCP = 6
 comptime IPPROTO_UDP = 17
 
 comptime SOL_SOCKET = 1
@@ -114,6 +113,14 @@ def accept(
     addr_len_ptr: UnsafePointer[UInt32, MutAnyOrigin],
 ) -> Int32:
     return external_call["accept", Int32](fd, addr_ptr, addr_len_ptr)
+
+
+def getsockname(
+    fd: Int32,
+    addr_ptr: UnsafePointer[UInt8, MutAnyOrigin],
+    addr_len_ptr: UnsafePointer[UInt32, MutAnyOrigin],
+) -> Int32:
+    return external_call["getsockname", Int32](fd, addr_ptr, addr_len_ptr)
 
 
 def send(fd: Int32, buf: UnsafePointer[UInt8, _], n: Int, flags: Int32) -> Int:
@@ -265,6 +272,8 @@ def errno_message(code: Int32) -> String:
         return "EBADF"
     if code == 4:
         return "EINTR"
+    if code == 115:
+        return "EINPROGRESS"
     return "errno=" + String(Int(code))
 
 

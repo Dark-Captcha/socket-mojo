@@ -16,7 +16,7 @@
 
 from std.ffi import external_call
 
-from socket._libc import AF_INET, AF_INET6, AF_UNSPEC, SOCK_STREAM
+from socket._libc import AF_INET, AF_INET6, SOCK_STREAM
 from socket.addr import IpAddress, parse_ip
 
 
@@ -218,64 +218,76 @@ def _await_recv(mut ring: Ring) raises -> Completion:
             # timeout partners and close acks: nothing to check
 
 
-def _query_udp(
-    server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
-) raises -> List[UInt8]:
-    var ring = Ring(16)
-    var fd = _connected_socket(server, Int32(SOCK_DGRAM))
-    _ = ring.send_copy(fd, query)
-    _ = ring.recv_with_timeout(fd, 2048, Int64(timeout_ms) * 1_000_000)
-    var got = _await_recv(ring)
-    _ = ring.close_fd(fd)
-    _ = ring.wait(min_complete=1)
+def _drain(mut ring: Ring) raises:
+    """Reap and discard any remaining completions on a private ring."""
     while True:
         var c = ring.next_completion()
         if not c:
             break
         _ = c.take()
-    if got.res == -125:  # ECANCELED: the deadline fired first
-        raise Error("socket.dns: query timed out")
-    got.ok()
-    return got.take_buffer()
+
+
+def _query_udp(
+    server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
+) raises -> List[UInt8]:
+    var ring = Ring(16)
+    # _connected_socket returns a raw fd nothing owns; reclaim it on every
+    # exit (the ring only owns its own io_uring fd).
+    var fd = _connected_socket(server, Int32(SOCK_DGRAM))
+    try:
+        _ = ring.send_copy(fd, query)
+        _ = ring.recv_with_timeout(fd, 2048, Int64(timeout_ms) * 1_000_000)
+        var got = _await_recv(ring)
+        if got.res == -125:  # ECANCELED: the deadline fired first
+            raise Error("socket.dns: query timed out")
+        got.ok()
+        var payload = got.take_buffer()
+        _ = ring.close_fd(fd)
+        _ = ring.wait(min_complete=1)
+        _drain(ring)
+        return payload^
+    except e:
+        _ = _libc_close(fd)
+        raise e^
 
 
 def _query_tcp(
     server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
 ) raises -> List[UInt8]:
     var ring = Ring(16)
+    # _connected_socket returns a raw fd nothing owns; reclaim it on every exit.
     var fd = _connected_socket(server, Int32(SOCK_STREAM))
-    # RFC 1035 4.2.2: two-byte big-endian length prefix
-    var framed = List[UInt8](capacity=len(query) + 2)
-    framed.append(UInt8(len(query) >> 8))
-    framed.append(UInt8(len(query) & 0xFF))
-    framed.extend(query)
-    _ = ring.send(fd, framed^)
-    var acc = List[UInt8]()
-    var want = -1
-    var deadline_each = Int64(timeout_ms) * 1_000_000
-    while want < 0 or len(acc) < want + 2:
-        _ = ring.recv_with_timeout(fd, 4096, deadline_each)
-        var got = _await_recv(ring)
-        if got.res == -125:
-            raise Error("socket.dns: tcp query timed out")
-        got.ok()
-        if got.res == 0:
-            raise Error("socket.dns: tcp connection closed early")
-        var chunk = got.take_buffer()
-        acc.extend(Span(chunk))
-        if want < 0 and len(acc) >= 2:
-            want = (Int(acc[0]) << 8) | Int(acc[1])
-    _ = ring.close_fd(fd)
-    _ = ring.wait(min_complete=1)
-    while True:
-        var c = ring.next_completion()
-        if not c:
-            break
-        _ = c.take()
-    var body = List[UInt8](capacity=want)
-    for i in range(want):
-        body.append(acc[2 + i])
-    return body^
+    try:
+        # RFC 1035 4.2.2: two-byte big-endian length prefix
+        var framed = List[UInt8](capacity=len(query) + 2)
+        framed.append(UInt8(len(query) >> 8))
+        framed.append(UInt8(len(query) & 0xFF))
+        framed.extend(query)
+        _ = ring.send(fd, framed^)
+        var acc = List[UInt8]()
+        var want = -1
+        var deadline_each = Int64(timeout_ms) * 1_000_000
+        while want < 0 or len(acc) < want + 2:
+            _ = ring.recv_with_timeout(fd, 4096, deadline_each)
+            var got = _await_recv(ring)
+            if got.res == -125:
+                raise Error("socket.dns: tcp query timed out")
+            got.ok()
+            if got.res == 0:
+                raise Error("socket.dns: tcp connection closed early")
+            var chunk = got.take_buffer()
+            acc.extend(Span(chunk))
+            if want < 0 and len(acc) >= 2:
+                want = (Int(acc[0]) << 8) | Int(acc[1])
+        _ = ring.close_fd(fd)
+        _ = ring.wait(min_complete=1)
+        _drain(ring)
+        var body = List[UInt8](capacity=want)
+        body.extend(Span(acc)[2 : 2 + want])
+        return body^
+    except e:
+        _ = _libc_close(fd)
+        raise e^
 
 
 def resolve_dns(
@@ -287,11 +299,13 @@ def resolve_dns(
     retries: Int = 2,
 ) raises -> List[IpAddress]:
     """Resolves `host` against an explicit DNS server through the
-    io_uring engine: UDP with per-attempt deadline and fresh
-    transaction ids, TCP fallback on truncation. NXDOMAIN and other
-    server errors raise; an empty answer returns an empty list.
-    (resolve(), above, remains the system-configured getaddrinfo
-    path.)"""
+    io_uring engine.
+
+    UDP with per-attempt deadline and fresh transaction ids, TCP
+    fallback on truncation. NXDOMAIN and other server errors raise; an
+    empty answer returns an empty list. (resolve(), above, remains the
+    system-configured getaddrinfo path.)
+    """
     try:
         var literal = parse_ip(host)
         var out = List[IpAddress]()
@@ -316,10 +330,10 @@ def resolve_dns(
                     + " attempts"
                 )
             continue
-        var ans = dns_parse_response(Span(raw), txid, qtype)
+        var ans = dns_parse_response(Span(raw), txid, qtype, host)
         if ans.truncated:
             var raw2 = _query_tcp(server, Span(query), timeout_ms)
-            ans = dns_parse_response(Span(raw2), txid, qtype)
+            ans = dns_parse_response(Span(raw2), txid, qtype, host)
         if ans.rcode != 0:
             # server-reported errors are final, no retry
             raise Error(

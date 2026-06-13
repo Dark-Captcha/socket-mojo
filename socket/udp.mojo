@@ -103,44 +103,58 @@ struct UdpSocket(Movable):
         var alen = write_sockaddr(
             sa.unsafe_ptr(), peer.ip.is_v6, peer.ip.octets, peer.port
         )
-        var n = sendto(
-            self.fd,
-            data.unsafe_ptr(),
-            len(data),
-            Int32(0),
-            sa.unsafe_ptr(),
-            alen,
-        )
-        if n < 0:
-            raise Error("socket.udp: sendto(2) " + errno_message(errno()))
+        var n: Int
+        while True:
+            n = sendto(
+                self.fd,
+                data.unsafe_ptr(),
+                len(data),
+                Int32(0),
+                sa.unsafe_ptr(),
+                alen,
+            )
+            if n >= 0:
+                break
+            var e = errno()
+            if e == 4:  # EINTR: retry transparently
+                continue
+            raise Error("socket.udp: sendto(2) " + errno_message(e))
         return n
 
     def recv_from(
         mut self, max_bytes: Int
     ) raises -> Tuple[List[UInt8], SocketAddr]:
         """Receive one datagram. Bytes exceeding `max_bytes` are
-        truncated and discarded by the kernel; QUIC will pre-size."""
-        var buf = List[UInt8](length=max_bytes, fill=0)
+        truncated and discarded by the kernel; QUIC will pre-size.
+        Single allocation: recv into a full-size buffer, then truncate
+        in place (same idiom as TcpSocket.read) — no second alloc, no
+        per-byte copy."""
+        var buf = List[UInt8](capacity=max_bytes)
+        buf.resize(unsafe_uninit_length=max_bytes)
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = UInt32(SOCKADDR_STORAGE_SIZE)
-        var n = recvfrom(
-            self.fd,
-            buf.unsafe_ptr(),
-            max_bytes,
-            Int32(0),
-            sa.unsafe_ptr(),
-            UnsafePointer(to=alen),
-        )
-        if n < 0:
-            raise Error("socket.udp: recvfrom(2) " + errno_message(errno()))
-        var out = List[UInt8](capacity=n)
-        for i in range(n):
-            out.append(buf[i])
+        var n: Int
+        while True:
+            n = recvfrom(
+                self.fd,
+                buf.unsafe_ptr(),
+                max_bytes,
+                Int32(0),
+                sa.unsafe_ptr(),
+                UnsafePointer(to=alen),
+            )
+            if n >= 0:
+                break
+            var e = errno()
+            if e == 4:  # EINTR: retry transparently
+                continue
+            raise Error("socket.udp: recvfrom(2) " + errno_message(e))
+        buf.resize(unsafe_uninit_length=n)
         var is_v6: Bool
         var octets: InlineArray[UInt8, 16]
         var port: UInt16
         is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
-        return (out^, SocketAddr(IpAddress(is_v6, octets), port))
+        return (buf^, SocketAddr(IpAddress(is_v6, octets), port))
 
     def set_read_timeout(mut self, seconds: Float64) raises:
         _set_one_timeout(self.fd, SO_RCVTIMEO, seconds)

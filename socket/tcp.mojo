@@ -35,9 +35,9 @@ from socket._libc import (
     connect,
     errno,
     errno_message,
+    getsockname,
     listen,
     read_sockaddr,
-    readv,
     recv,
     send,
     setsockopt,
@@ -142,18 +142,18 @@ struct TcpSocket(Movable):
                 raise Error("socket.tcp: send() " + errno_message(e))
 
     def read(mut self, max_bytes: Int) raises -> List[UInt8]:
-        """Read up to `max_bytes`. May return fewer (0 means EOF).
-        Zero-copy: a single List is allocated at full size and resized
-        down to the actual byte count via the `length` mutator path."""
+        """Read up to `max_bytes`. May return fewer (0 means EOF). The
+        buffer is allocated uninitialized at full size and truncated in
+        place to the actual recv count — no second allocation, no copy,
+        and no pre-zeroing of bytes the kernel is about to overwrite."""
         if max_bytes <= 0:
             return List[UInt8]()
-        var out = List[UInt8](length=max_bytes, fill=0)
+        var out = List[UInt8](capacity=max_bytes)
+        out.resize(unsafe_uninit_length=max_bytes)
         while True:
             var n = recv(self.fd, out.unsafe_ptr(), max_bytes, Int32(0))
             if n >= 0:
                 # Truncate the List in-place to the actual recv size.
-                # No copy: just shrink len; the trailing capacity is
-                # released when the List drops or grows past it.
                 out.resize(unsafe_uninit_length=n)
                 return out^
             var e = errno()
@@ -186,7 +186,9 @@ struct TcpSocket(Movable):
         cooperates, vs N round trips through userspace."""
         if n <= 0:
             return List[UInt8]()
-        var out = List[UInt8](length=n, fill=0)
+        # Uninitialized: the kernel fills it (MSG_WAITALL); no wasted zero-fill.
+        var out = List[UInt8](capacity=n)
+        out.resize(unsafe_uninit_length=n)
         var off = 0
         while off < n:
             var got = recv(
@@ -383,13 +385,15 @@ struct TcpListener(Movable):
         socket and its address."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = UInt32(SOCKADDR_STORAGE_SIZE)
-        var afd = accept(
-            self.fd,
-            sa.unsafe_ptr(),
-            UnsafePointer(to=alen),
-        )
-        if afd < 0:
-            _raise("socket.tcp: accept(2)", errno())
+        var afd: Int32
+        while True:
+            afd = accept(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen))
+            if afd >= 0:
+                break
+            var e = errno()
+            if e == 4:  # EINTR: retry transparently
+                continue
+            _raise("socket.tcp: accept(2)", e)
         var is_v6: Bool
         var octets: InlineArray[UInt8, 16]
         var port: UInt16
@@ -400,10 +404,17 @@ struct TcpListener(Movable):
         )
 
     def local_addr(self) raises -> SocketAddr:
-        # getsockname is a separate syscall; we omit it from v0 because
-        # the listener was constructed FROM a known address. Callers
-        # bind explicitly; the auto-port case will be added when needed.
-        raise Error("socket.tcp: local_addr() not yet implemented")
+        """The address this listener is bound to (resolves the kernel-
+        chosen port when bound with port 0)."""
+        var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
+        var alen = UInt32(SOCKADDR_STORAGE_SIZE)
+        if getsockname(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen)) != 0:
+            _raise("socket.tcp: getsockname(2)", errno())
+        var is_v6: Bool
+        var octets: InlineArray[UInt8, 16]
+        var port: UInt16
+        is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
+        return SocketAddr(IpAddress(is_v6, octets), port)
 
 
 def _apply_timeout(fd: Int32, seconds: Float64):

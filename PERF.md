@@ -3,12 +3,21 @@
 Measured 2026-06-13 on this machine (AMD 7950X3D, kernel 7.0.x,
 Mojo b2). `pixi run mojo run -I . benchmarks/bench_ring.mojo`.
 
+> Re-measured 2026-06-13 after the audit pass. The fan-out figures
+> below supersede the earlier ones: the harness used to do an O(conns²)
+> per-completion server/client fd classification *inside the timed
+> loop*, which depressed the 256-conn number; it is now an O(1) lookup,
+> so the per-connection rate reads as genuinely flat. Single-connection
+> numbers are unchanged within run-to-run noise (the audit's submit-path
+> tweaks — one-shot SQE clear, uninitialized recv buffers — don't move a
+> loopback ping-pong measurably).
+
 ## Loopback ping-pong (single connection)
 
 |       | blocking | epoll  | ring (multishot + pbuf) |
 |------:|---------:|-------:|------------------------:|
-| 64 B  | 152 k/s  | 138 k/s| 116 k/s                 |
-| 16 KiB| 121 k/s  | 109 k/s|  91 k/s                 |
+| 64 B  | 149 k/s  | 135 k/s| 114 k/s                 |
+| 16 KiB| 119 k/s  | 108 k/s|  90 k/s                 |
 
 The Ring runs ~75% of blocking here, and that is the **expected
 shape**, not a regression. A 64-byte ping-pong is the
@@ -23,14 +32,17 @@ path doesn't have. epoll lands between because it adds the
 
 |        | rate (rt/s) |
 |-------:|------------:|
-|   8 conns | 146 k/s |
-|  64 conns | 147 k/s |
-| 256 conns | 136 k/s |
+|   8 conns | 142 k/s |
+|  64 conns | 145 k/s |
+| 256 conns | 142 k/s |
 
 Per-connection rate stays flat: one ring drives 256 simultaneous
 echo flows with no measurable degradation, where the same workload
 on epoll would require explicit edge-triggered draining and the
-blocking model needs one thread per connection.
+blocking model needs one thread per connection. (The earlier table
+showed 256 conns sagging to 136 k/s; that dip was a benchmark artifact
+— an O(conns²) fd-classification scan in the timed loop — not the
+engine, and it disappears once the scan is O(1).)
 
 ## Why the absolute number isn't bigger here
 
