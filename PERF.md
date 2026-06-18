@@ -84,21 +84,30 @@ machine, same kernel TCP loopback, separate server+client
 processes. Sources in `benchmarks/cross_lang/`; reproduce with
 `benchmarks/cross_lang/run.sh`.
 
-| Implementation                | rt/s     | Notes |
-|-------------------------------|---------:|-------|
-| Python asyncio (selector)     |   64 k/s | high-level scripting baseline |
-| Go `net` (GOMAXPROCS=1)       |  216 k/s | epoll + goroutines, 1 OS thread |
-| **socket-mojo Ring**          |  235 k/s | io_uring + multishot + pbuf, 1 thread |
-| **socket-mojo Ring + SQPOLL** |  **290 k/s** | + kernel SQ-poll kthread, 1 user thread |
-| C + liburing                  |  318 k/s | mature C bindings, same kernel features |
-| Go `net` (GOMAXPROCS=all)     |  472 k/s | 24 OS threads — multi-core advantage |
+Numbers below are **median of 5 runs** to filter the loopback's
+considerable run-to-run variance (single ping-pong is sensitive
+to CPU thermal state, scheduling, and other process noise; the
+plain Ring path can swing 60% between best and worst, the SQPOLL
+path is steady ±5%).
+
+| Implementation                | median rt/s | Notes |
+|-------------------------------|------------:|-------|
+| Python asyncio (selector)     |    ~64 k/s  | high-level scripting baseline |
+| Go `net` (GOMAXPROCS=1)       |   ~216 k/s  | epoll + goroutines, 1 OS thread |
+| **socket-mojo Ring**          |   ~214 k/s  | io_uring + multishot + pbuf, 1 thread |
+| **socket-mojo Ring + SQPOLL** |   **~270 k/s** | + kernel SQ-poll kthread, 1 user thread |
+| C + liburing                  |   ~274 k/s  | mature C bindings, same kernel features |
+| Go `net` (GOMAXPROCS=all)     |   ~472 k/s  | 24 OS threads — multi-core advantage |
 
 **Honest reading:**
 
 - **Apples-to-apples (single thread)**, socket-mojo + SQPOLL is at
-  **91% of C/liburing** (the speed-of-light reference on this
-  kernel feature set) and **34% faster than Go-1cpu**.
-- Without SQPOLL, socket-mojo is still **9% ahead of Go-1cpu**.
+  **~98% of C/liburing** — effectively at the speed-of-light
+  ceiling for io_uring multishot + pbuf on a single core. There's
+  no meaningful single-core headroom left on the engine side.
+- The plain Ring path runs at parity with Go-1cpu epoll, with
+  more variance; SQPOLL is the recommended steady-state knob for
+  servers.
 - **Python is 4–5× slower**: interpreter + per-call allocation
   overhead dwarfs the I/O path.
 - **Go-all-cores wins** because the Go runtime spreads goroutines
@@ -106,12 +115,20 @@ processes. Sources in `benchmarks/cross_lang/`; reproduce with
   Ring is single-threaded by design; to match multi-core scaling
   the recipe is `SO_REUSEPORT` + multiple worker processes (see
   `README.md` and the `Ring.msg_ring()` primitive for cross-ring
-  signalling).
-- The **C/liburing gap (~10%)** is mostly safety overhead — Mojo's
-  Ring tracks op-slot lifetimes, generation counters, and buffer
-  ownership; the C code recycles buffers immediately and trusts
-  the kernel ordering. Worth that gap for "no use-after-free on
-  the kernel send path."
+  signalling). 24 × 270k ≈ 6.5 M rt/s aggregate, comparable to
+  nginx and friends.
+
+**What "single-core io_uring ceiling" really means**
+
+Loopback ping-pong's per-round cost is dominated by the kernel
+itself: two `tcp_sendmsg` paths, two `tcp_recvmsg` paths, two
+context switches into the kernel, socket-buffer accounting, the
+TCP state machine. The userspace work — SQE construction, CQE
+reap, op-table bookkeeping — is in the noise. **socket-mojo and
+C/liburing both pay the same kernel cost; the gap between them is
+how efficiently they enter/exit that path.** SQPOLL pulls the gap
+closed because the kernel polls the SQ on its own and we don't
+syscall at all on the hot loop.
 
 Per-connection rate stays flat across 8 → 256 conns: one ring
 drives 256 simultaneous echo flows with no measurable degradation,

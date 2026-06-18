@@ -569,6 +569,41 @@ struct Ring(Movable):
         owned.extend(data)
         return self.send(fd, owned^, fixed=fixed, zero_copy=zero_copy)
 
+    def send_borrowed(
+        mut self,
+        fd: Int32,
+        addr: UInt64,
+        length: Int,
+        *,
+        fixed: Bool = False,
+    ) raises -> OpId:
+        """Submit a send that references existing memory at `addr` /
+        `length` WITHOUT taking ownership of it. The caller MUST
+        keep the memory pinned and unmodified until the returned
+        OpId's CQE arrives, and the kernel must finish reading it
+        before the buffer is reused — for plain TCP/UDP this is
+        guaranteed by the time `wait()` returns the send completion.
+
+        Unsafe in general — useful when you have a long-lived static
+        buffer or pool and want to skip the per-call allocation in
+        send_copy. Symmetric with `recv` accepting any pointer."""
+        self._room()
+        var idx = self._alloc(KIND_SEND, fd, List[UInt8]())
+        var ud = self._user_data(idx, KIND_SEND)
+        var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
+        self.q.push_sqe(
+            OP_SEND,
+            fd,
+            addr,
+            UInt32(length),
+            0,
+            UInt32(0x4000),
+            ud,
+            sqe_flags=sqe_flags,
+        )
+        self.inflight += 1
+        return OpId(ud)
+
     def close_fd(
         mut self, fd: Int32, *, fixed: Bool = False
     ) raises -> OpId:
