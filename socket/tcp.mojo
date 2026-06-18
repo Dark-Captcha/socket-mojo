@@ -2,23 +2,28 @@
 # build on top of.
 #
 # `TcpSocket.connect` opens a client connection; `TcpListener` accepts
-# server connections. Both expose `read`/`write`/`close`/timeout via the
-# same shape, so an upper layer (TLS) can wrap either uniformly.
+# server connections. Both expose `read`/`write`/`close`/timeout via
+# the same shape, so an upper layer (TLS) can wrap either uniformly.
 #
 # Errors are raised with a `socket.tcp:` prefix and a stable kind tag
-# extracted from errno (e.g. `socket.tcp: ECONNREFUSED ...`). Callers
-# can pattern-match on the tag substring; we'll graduate to typed
-# errors when the rest of socket-mojo demands it.
+# extracted from the syscall return (e.g. `socket.tcp: ECONNREFUSED
+# ...`). Callers can pattern-match on the tag substring; we'll
+# graduate to typed errors when the rest of socket-mojo demands it.
+#
+# Every kernel call goes through socket/_syscalls.mojo — no libc
+# symbols. The negative syscall return is the error code; no errno
+# TLS slot is read.
 
 from std.memory import UnsafePointer
 
-from socket._libc import (
+from socket._syscalls import (
     AF_INET,
     AF_INET6,
     IPPROTO_TCP_LEVEL,
     MSG_NOSIGNAL,
     MSG_WAITALL,
     SHUT_RDWR,
+    SOCK_CLOEXEC,
     SOCK_STREAM,
     SOCKADDR_STORAGE_SIZE,
     SOL_SOCKET,
@@ -29,22 +34,21 @@ from socket._libc import (
     SO_SNDBUF,
     SO_SNDTIMEO,
     TCP_NODELAY,
-    accept,
-    bind,
-    close,
-    connect,
-    errno,
     errno_message,
-    getsockname,
-    listen,
     read_sockaddr,
-    recv,
-    send,
-    setsockopt,
-    shutdown,
-    socket as libc_socket,
+    sys_accept4,
+    sys_bind,
+    sys_close,
+    sys_connect,
+    sys_getsockname,
+    sys_listen,
+    sys_recv,
+    sys_send,
+    sys_setsockopt,
+    sys_shutdown,
+    sys_socket,
+    sys_writev,
     write_sockaddr,
-    writev,
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.dns import resolve
@@ -68,7 +72,7 @@ struct TcpSocket(Movable):
 
     def __del__(deinit self):
         if self.fd >= 0:
-            _ = close(self.fd)
+            _ = sys_close(self.fd)
 
     @staticmethod
     def from_fd(fd: Int32, is_v6: Bool) -> TcpSocket:
@@ -92,74 +96,74 @@ struct TcpSocket(Movable):
         for ip_index in range(len(addrs)):
             var ip = addrs[ip_index]
             var family = AF_INET6 if ip.is_v6 else AF_INET
-            var fd = libc_socket(Int32(family), Int32(SOCK_STREAM), Int32(0))
-            if fd < 0:
-                last_err = "socket.tcp: socket(2) " + errno_message(errno())
+            var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
+            if rc < 0:
+                last_err = "socket.tcp: socket(2) " + errno_message(Int32(-rc))
                 continue
+            var fd = Int32(rc)
             var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
             var alen = write_sockaddr(
                 sa.unsafe_ptr(), ip.is_v6, ip.octets, port
             )
-            # The kernel-default connect timeout can be many minutes; we
-            # set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the syscall
-            # itself respects the deadline.
+            # The kernel-default connect timeout can be many minutes;
+            # we set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the
+            # syscall itself respects the deadline.
             _apply_timeout(fd, timeout_seconds)
-            var rv = connect(fd, sa.unsafe_ptr(), alen)
+            var rv = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
             if rv == 0:
                 return TcpSocket(fd, ip.is_v6)
             last_err = (
                 "socket.tcp: connect() "
-                + errno_message(errno())
+                + errno_message(Int32(-rv))
                 + " ("
                 + ip.to_string()
                 + ":"
                 + String(Int(port))
                 + ")"
             )
-            _ = close(fd)
+            _ = sys_close(fd)
         raise Error(last_err)
 
     def write(mut self, data: Span[UInt8, _]) raises:
         """Send `data` in full, looping over short writes. MSG_NOSIGNAL
-        prevents the process from being killed by SIGPIPE when the peer
-        closes — we raise EPIPE instead, which the caller can handle."""
+        prevents the process from being killed by SIGPIPE when the
+        peer closes — we raise EPIPE instead, which the caller can
+        handle."""
         var off = 0
         while off < len(data):
-            var n = send(
+            var n = sys_send(
                 self.fd,
                 data.unsafe_ptr() + off,
                 len(data) - off,
-                Int32(MSG_NOSIGNAL),
+                MSG_NOSIGNAL,
             )
             if n > 0:
                 off += n
             elif n == 0:
                 raise Error("socket.tcp: write returned 0 (peer closed)")
             else:
-                var e = errno()
-                if e == 4:  # EINTR: retry transparently
+                if n == -4:  # EINTR: retry transparently
                     continue
-                raise Error("socket.tcp: send() " + errno_message(e))
+                raise Error("socket.tcp: send() " + errno_message(Int32(-n)))
 
     def read(mut self, max_bytes: Int) raises -> List[UInt8]:
         """Read up to `max_bytes`. May return fewer (0 means EOF). The
-        buffer is allocated uninitialized at full size and truncated in
-        place to the actual recv count — no second allocation, no copy,
-        and no pre-zeroing of bytes the kernel is about to overwrite."""
+        buffer is allocated uninitialized at full size and truncated
+        in place to the actual recv count — no second allocation, no
+        copy, and no pre-zeroing of bytes the kernel is about to
+        overwrite."""
         if max_bytes <= 0:
             return List[UInt8]()
         var out = List[UInt8](capacity=max_bytes)
         out.resize(unsafe_uninit_length=max_bytes)
         while True:
-            var n = recv(self.fd, out.unsafe_ptr(), max_bytes, Int32(0))
+            var n = sys_recv(self.fd, out.unsafe_ptr(), max_bytes, 0)
             if n >= 0:
-                # Truncate the List in-place to the actual recv size.
                 out.resize(unsafe_uninit_length=n)
                 return out^
-            var e = errno()
-            if e == 4:  # EINTR
+            if n == -4:  # EINTR
                 continue
-            raise Error("socket.tcp: recv() " + errno_message(e))
+            raise Error("socket.tcp: recv() " + errno_message(Int32(-n)))
 
     def read_into(
         mut self, mut buf: List[UInt8], *, offset: Int = 0
@@ -172,27 +176,25 @@ struct TcpSocket(Movable):
         if cap <= 0:
             return 0
         while True:
-            var n = recv(self.fd, buf.unsafe_ptr() + offset, cap, Int32(0))
+            var n = sys_recv(self.fd, buf.unsafe_ptr() + offset, cap, 0)
             if n >= 0:
                 return n
-            var e = errno()
-            if e == 4:
+            if n == -4:
                 continue
-            raise Error("socket.tcp: recv() " + errno_message(e))
+            raise Error("socket.tcp: recv() " + errno_message(Int32(-n)))
 
     def read_exact(mut self, n: Int) raises -> List[UInt8]:
-        """Read exactly `n` bytes. Uses MSG_WAITALL so the kernel loops
-        internally — one syscall covers the whole read when the peer
-        cooperates, vs N round trips through userspace."""
+        """Read exactly `n` bytes. Uses MSG_WAITALL so the kernel
+        loops internally — one syscall covers the whole read when
+        the peer cooperates, vs N round trips through userspace."""
         if n <= 0:
             return List[UInt8]()
-        # Uninitialized: the kernel fills it (MSG_WAITALL); no wasted zero-fill.
         var out = List[UInt8](capacity=n)
         out.resize(unsafe_uninit_length=n)
         var off = 0
         while off < n:
-            var got = recv(
-                self.fd, out.unsafe_ptr() + off, n - off, Int32(MSG_WAITALL)
+            var got = sys_recv(
+                self.fd, out.unsafe_ptr() + off, n - off, MSG_WAITALL
             )
             if got > 0:
                 off += got
@@ -205,10 +207,11 @@ struct TcpSocket(Movable):
                     + " bytes before EOF"
                 )
             else:
-                var e = errno()
-                if e == 4:
+                if got == -4:
                     continue
-                raise Error("socket.tcp: recv() " + errno_message(e))
+                raise Error(
+                    "socket.tcp: recv() " + errno_message(Int32(-got))
+                )
         return out^
 
     def write_vectored(
@@ -218,10 +221,10 @@ struct TcpSocket(Movable):
         loopback this skips an extra kernel-mode crossing per buffer;
         on the wire it lets the kernel coalesce into a single TCP
         segment (no Nagle pingpong between header and body). TLS uses
-        this to emit `record_header || ciphertext || tag` in one shot.
-        """
-        # Build an iovec[] array. Linux `struct iovec` = (void*, size_t),
-        # 16 bytes per entry.
+        this to emit `record_header || ciphertext || tag` in one
+        shot."""
+        # Build an iovec[] array. Linux `struct iovec` = (void*,
+        # size_t), 16 bytes per entry.
         var n = len(buffers)
         if n == 0:
             return
@@ -240,12 +243,14 @@ struct TcpSocket(Movable):
         # Loop in case the kernel doesn't write everything (rare with
         # writev on a healthy socket, but possible). We don't restart
         # the iovec from the middle — instead we fall back to plain
-        # send() for the remainder. This is the same trick libcurl uses.
-        var sent = writev(self.fd, iov_ptr, Int32(n))
+        # send() for the remainder. This is the same trick libcurl
+        # uses.
+        var sent = sys_writev(self.fd, iov_ptr, n)
         if sent < 0:
-            raise Error("socket.tcp: writev() " + errno_message(errno()))
+            raise Error(
+                "socket.tcp: writev() " + errno_message(Int32(-sent))
+            )
         if sent < total:
-            # Compose the unsent tail into a flat buffer and send normally.
             var tail = List[UInt8](capacity=total - sent)
             var skip = sent
             for i in range(n):
@@ -262,33 +267,35 @@ struct TcpSocket(Movable):
 
     def set_recv_buffer(mut self, bytes: Int) raises:
         """Hint to the kernel about preferred recv buffer size. Linux
-        doubles whatever you pass; root can go past /proc/sys/net/core/
-        rmem_max."""
+        doubles whatever you pass; root can go past
+        /proc/sys/net/core/rmem_max."""
         var v = Int32(bytes)
-        var rv = setsockopt(
+        var rv = sys_setsockopt(
             self.fd,
-            Int32(SOL_SOCKET),
-            Int32(SO_RCVBUF),
+            SOL_SOCKET,
+            SO_RCVBUF,
             UnsafePointer(to=v).bitcast[UInt8](),
-            UInt32(4),
+            4,
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(SO_RCVBUF) " + errno_message(errno())
+                "socket.tcp: setsockopt(SO_RCVBUF) "
+                + errno_message(Int32(-rv))
             )
 
     def set_send_buffer(mut self, bytes: Int) raises:
         var v = Int32(bytes)
-        var rv = setsockopt(
+        var rv = sys_setsockopt(
             self.fd,
-            Int32(SOL_SOCKET),
-            Int32(SO_SNDBUF),
+            SOL_SOCKET,
+            SO_SNDBUF,
             UnsafePointer(to=v).bitcast[UInt8](),
-            UInt32(4),
+            4,
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(SO_SNDBUF) " + errno_message(errno())
+                "socket.tcp: setsockopt(SO_SNDBUF) "
+                + errno_message(Int32(-rv))
             )
 
     def set_read_timeout(mut self, seconds: Float64) raises:
@@ -299,38 +306,40 @@ struct TcpSocket(Movable):
 
     def set_nodelay(mut self, enabled: Bool) raises:
         var flag = Int32(1) if enabled else Int32(0)
-        var rv = setsockopt(
+        var rv = sys_setsockopt(
             self.fd,
-            Int32(IPPROTO_TCP_LEVEL),
-            Int32(TCP_NODELAY),
+            IPPROTO_TCP_LEVEL,
+            TCP_NODELAY,
             UnsafePointer(to=flag).bitcast[UInt8](),
-            UInt32(4),
+            4,
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(TCP_NODELAY) " + errno_message(errno())
+                "socket.tcp: setsockopt(TCP_NODELAY) "
+                + errno_message(Int32(-rv))
             )
 
     def set_keepalive(mut self, enabled: Bool) raises:
         var flag = Int32(1) if enabled else Int32(0)
-        var rv = setsockopt(
+        var rv = sys_setsockopt(
             self.fd,
-            Int32(SOL_SOCKET),
-            Int32(SO_KEEPALIVE),
+            SOL_SOCKET,
+            SO_KEEPALIVE,
             UnsafePointer(to=flag).bitcast[UInt8](),
-            UInt32(4),
+            4,
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(SO_KEEPALIVE) " + errno_message(errno())
+                "socket.tcp: setsockopt(SO_KEEPALIVE) "
+                + errno_message(Int32(-rv))
             )
 
     def close(deinit self):
         """Explicit close. Equivalent to letting the socket go out of
         scope, but lets the caller surface an EBADF if it happens."""
         if self.fd >= 0:
-            _ = shutdown(self.fd, Int32(SHUT_RDWR))
-            _ = close(self.fd)
+            _ = sys_shutdown(self.fd, SHUT_RDWR)
+            _ = sys_close(self.fd)
 
 
 struct TcpListener(Movable):
@@ -345,7 +354,7 @@ struct TcpListener(Movable):
 
     def __del__(deinit self):
         if self.fd >= 0:
-            _ = close(self.fd)
+            _ = sys_close(self.fd)
 
     @staticmethod
     def bind(addr: SocketAddr, *, backlog: Int = 128) raises -> TcpListener:
@@ -353,63 +362,68 @@ struct TcpListener(Movable):
         so a recently-stopped server can rebind without TIME_WAIT
         delay."""
         var family = AF_INET6 if addr.ip.is_v6 else AF_INET
-        var fd = libc_socket(Int32(family), Int32(SOCK_STREAM), Int32(0))
-        if fd < 0:
-            _raise("socket.tcp: socket(2)", errno())
+        var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
+        if rc < 0:
+            _raise("socket.tcp: socket(2)", Int32(-rc))
+        var fd = Int32(rc)
         var one = Int32(1)
-        _ = setsockopt(
+        _ = sys_setsockopt(
             fd,
-            Int32(SOL_SOCKET),
-            Int32(SO_REUSEADDR),
+            SOL_SOCKET,
+            SO_REUSEADDR,
             UnsafePointer(to=one).bitcast[UInt8](),
-            UInt32(4),
+            4,
         )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
             sa.unsafe_ptr(), addr.ip.is_v6, addr.ip.octets, addr.port
         )
-        var rv = bind(fd, sa.unsafe_ptr(), alen)
+        var rv = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
-            var e = errno()
-            _ = close(fd)
-            _raise("socket.tcp: bind(2)", e)
-        rv = listen(fd, Int32(backlog))
+            _ = sys_close(fd)
+            _raise("socket.tcp: bind(2)", Int32(-rv))
+        rv = sys_listen(fd, backlog)
         if rv != 0:
-            var e = errno()
-            _ = close(fd)
-            _raise("socket.tcp: listen(2)", e)
+            _ = sys_close(fd)
+            _raise("socket.tcp: listen(2)", Int32(-rv))
         return TcpListener(fd, addr.ip.is_v6)
 
     def accept(mut self) raises -> Tuple[TcpSocket, SocketAddr]:
         """Block until an inbound connection arrives; return the peer
-        socket and its address."""
+        socket and its address. Uses accept4(2) with SOCK_CLOEXEC so
+        the accepted fd is exec-safe without a follow-up fcntl."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = UInt32(SOCKADDR_STORAGE_SIZE)
-        var afd: Int32
+        var rc: Int
         while True:
-            afd = accept(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen))
-            if afd >= 0:
+            rc = sys_accept4(
+                self.fd,
+                sa.unsafe_ptr(),
+                UnsafePointer(to=alen),
+                SOCK_CLOEXEC,
+            )
+            if rc >= 0:
                 break
-            var e = errno()
-            if e == 4:  # EINTR: retry transparently
+            if rc == -4:  # EINTR: retry transparently
                 continue
-            _raise("socket.tcp: accept(2)", e)
+            _raise("socket.tcp: accept(2)", Int32(-rc))
         var is_v6: Bool
         var octets: InlineArray[UInt8, 16]
         var port: UInt16
         is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
         return (
-            TcpSocket(afd, is_v6),
+            TcpSocket(Int32(rc), is_v6),
             SocketAddr(IpAddress(is_v6, octets), port),
         )
 
     def local_addr(self) raises -> SocketAddr:
-        """The address this listener is bound to (resolves the kernel-
-        chosen port when bound with port 0)."""
+        """The address this listener is bound to (resolves the
+        kernel-chosen port when bound with port 0)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = UInt32(SOCKADDR_STORAGE_SIZE)
-        if getsockname(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen)) != 0:
-            _raise("socket.tcp: getsockname(2)", errno())
+        var rv = sys_getsockname(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen))
+        if rv != 0:
+            _raise("socket.tcp: getsockname(2)", Int32(-rv))
         var is_v6: Bool
         var octets: InlineArray[UInt8, 16]
         var port: UInt16
@@ -418,9 +432,9 @@ struct TcpListener(Movable):
 
 
 def _apply_timeout(fd: Int32, seconds: Float64):
-    """Internal best-effort timeout setter — used during connect, where
-    we don't want to raise (we want to fall through to the connect
-    error)."""
+    """Internal best-effort timeout setter — used during connect,
+    where we don't want to raise (we want to fall through to the
+    connect error)."""
     _apply_one_timeout_quiet(fd, SO_RCVTIMEO, seconds)
     _apply_one_timeout_quiet(fd, SO_SNDTIMEO, seconds)
 
@@ -431,12 +445,8 @@ def _apply_one_timeout_quiet(fd: Int32, name: Int, seconds: Float64):
     var tv = InlineArray[Int64, 2](fill=0)
     tv[0] = Int64(seconds)
     tv[1] = Int64((seconds - Float64(tv[0])) * 1e6)
-    _ = setsockopt(
-        fd,
-        Int32(SOL_SOCKET),
-        Int32(name),
-        tv.unsafe_ptr().bitcast[UInt8](),
-        UInt32(16),
+    _ = sys_setsockopt(
+        fd, SOL_SOCKET, name, tv.unsafe_ptr().bitcast[UInt8](), 16
     )
 
 
@@ -446,12 +456,10 @@ def _apply_one_timeout(fd: Int32, name: Int, seconds: Float64) raises:
     if seconds > 0:
         tv[0] = Int64(seconds)
         tv[1] = Int64((seconds - Float64(tv[0])) * 1e6)
-    var rv = setsockopt(
-        fd,
-        Int32(SOL_SOCKET),
-        Int32(name),
-        tv.unsafe_ptr().bitcast[UInt8](),
-        UInt32(16),
+    var rv = sys_setsockopt(
+        fd, SOL_SOCKET, name, tv.unsafe_ptr().bitcast[UInt8](), 16
     )
     if rv != 0:
-        raise Error("socket.tcp: setsockopt(timeout) " + errno_message(errno()))
+        raise Error(
+            "socket.tcp: setsockopt(timeout) " + errno_message(Int32(-rv))
+        )

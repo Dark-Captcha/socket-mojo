@@ -1,8 +1,16 @@
 # socket-mojo — Design (v1 rethink)
 
-> Status: accepted 2026-06-13. Supersedes the tier-1/2 plan implied by
-> v0.1–v0.3. Those layers stay (see "What already exists"), but the
-> foundation everything else builds on is the completion engine below.
+> Status: accepted 2026-06-13, updated 2026-06-18. Supersedes the
+> tier-1/2 plan implied by v0.1–v0.3. Those layers stay (see "What
+> already exists"), but the foundation everything else builds on is
+> the completion engine below. **2026-06-18 update**: every socket
+> operation in the library now goes through a direct Linux syscall
+> via one `external_call["syscall", ...]` shim — no libc socket
+> wrappers, no getaddrinfo, no glibc resolver. The only libc symbols
+> the library touches are `syscall(3)` (the register-loading
+> trampoline for the kernel `syscall` instruction) and
+> `__errno_location` (one TLS-slot pointer). When Mojo's inline-asm
+> story stabilises both collapse away.
 
 socket-mojo is the I/O base for an entire protocol stack written in
 Mojo: tls-mojo, http-mojo (1.1/2/3), ws-mojo, mail-mojo (SMTP/IMAP),
@@ -33,11 +41,11 @@ while serving:
         ...
 ```
 
-Proven in `.probe/uring_probe.mojo`: ring setup, mmap, SQE submit and
-CQE reap work from pure Mojo via raw syscalls (425/426/427) — **no
-liburing**, no new dependencies. The kernel ABI is the stable
-interface, the rings are just shared memory, and this machine's kernel
-reports the full modern feature set (features=0x3ffff).
+Ring setup, mmap, SQE submit and CQE reap work from pure Mojo via
+raw syscalls (425/426/427) — **no liburing**, no new dependencies.
+The kernel ABI is the stable interface, the rings are just shared
+memory, and on a 7.x kernel we report the full modern feature set
+(features=0x3ffff).
 
 Engine specifics:
 
@@ -90,10 +98,9 @@ That contract is the whole interface between the repos.
 
 ### 3. No async/await — yet, and on purpose
 
-Probed (`.probe/async_status_probe.mojo`): Mojo 1.0b2 parses
-`async def`/`await`, but a `Coroutine` value can't even be destroyed in
-sync code and there is no executor. Building the foundation on that is
-building on sand.
+Mojo 1.0b3 parses `async def`/`await`, but a `Coroutine` value
+can't even be destroyed in sync code and there is no executor.
+Building the foundation on that is building on sand.
 
 The explicit completion loop **is** the v1 API. It is also exactly the
 substrate a future coroutine layer suspends on: when Mojo's async
@@ -112,13 +119,18 @@ by waiting except syntax.
   socket/ring.mojo     Ring: SQ/CQ management, op table, multishot,
                        buffer rings, timeouts, cancel        ← THE CORE
   socket/uring_sys.mojo raw syscalls 425/426/427, SQE/CQE layout,
-                       mmap, feature detection
+                       mmap, feature detection, SQPOLL + modern
+                       taskrun flags
 ─────────────────────────────────────────────────────────────────────
-  existing, kept as-is:
-  socket/_libc.mojo    socket/bind/listen/connect/setsockopt/errno
+  socket/_syscalls.mojo all direct Linux syscalls (socket/bind/listen/
+                       connect/send/recv/setsockopt/mmap/epoll/fcntl/
+                       openat/getrandom/...); no libc symbols beyond
+                       the syscall trampoline and __errno_location
   socket/addr.mojo     sockaddr_in/in6 packing, parsing
-  socket/dns.mojo      resolver — becomes the first sans-io protocol
-                       driven through the Ring (UDP + TCP fallback)
+  socket/dnswire.mojo  sans-io RFC 1035 codec
+  socket/dns.mojo      native resolver: /etc/hosts + /etc/resolv.conf
+                       + sans-io DNS driven through the Ring (UDP +
+                       TCP fallback) — no getaddrinfo
   socket/tcp.mojo,
   udp.mojo, poller.mojo blocking + epoll APIs — the simple tier for
                        scripts/tests and non-Linux fallback later
@@ -134,8 +146,8 @@ by waiting except syntax.
   state machines — deterministic, no sockets in CI.
 - Throughput sanity: echo benchmark vs the epoll tier and vs a C
   baseline, so regressions in the engine are numbers, not vibes.
-- `.probe/` stays the scratchpad: every io_uring opcode gets a probe
-  proving kernel behavior before the Ring grows it.
+- Each io_uring opcode gets its kernel behaviour validated against
+  a python truth peer before the Ring grows it.
 
 ## Milestones
 

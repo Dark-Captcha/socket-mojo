@@ -1,10 +1,18 @@
-# In-process epoll test using socketpair(2). Avoids Python helpers and
-# the tuple-move ergonomics around accept() — proves the Poller +
+# In-process epoll test using socketpair(2). Avoids Python helpers
+# and the tuple-move ergonomics around accept() — proves the Poller +
 # non-blocking + read/write path through a single thread.
 
 from std.memory import UnsafePointer
 
-from socket._libc import close, recv, send, socketpair_unix
+from socket._syscalls import (
+    AF_UNIX,
+    MSG_DONTWAIT,
+    SOCK_STREAM,
+    sys_close,
+    sys_recv,
+    sys_send,
+    sys_socketpair,
+)
 from socket.nonblocking import is_would_block, set_nonblocking
 from socket.poller import Poller
 from tests.helpers import check
@@ -13,7 +21,9 @@ from tests.helpers import check
 def run() raises:
     # Create a connected pair (a/b are two ends of one channel).
     var pair = InlineArray[Int32, 2](fill=-1)
-    var rv = socketpair_unix(pair.unsafe_ptr().bitcast[UInt8]())
+    var rv = sys_socketpair(
+        AF_UNIX, SOCK_STREAM, 0, pair.unsafe_ptr().bitcast[UInt8]()
+    )
     check(rv == 0, "socketpair created")
     var a = pair[0]
     var b = pair[1]
@@ -30,7 +40,7 @@ def run() raises:
 
     # Write through `a`. send() defaults to blocking.
     var msg = "epoll!".as_bytes()
-    var nsent = send(a, msg.unsafe_ptr(), len(msg), Int32(0))
+    var nsent = sys_send(a, msg.unsafe_ptr(), len(msg), 0)
     check(nsent == 6, "send 6 bytes through socketpair[0]")
 
     # Now wait — should report `b` is readable within ~100 ms.
@@ -42,14 +52,14 @@ def run() raises:
 
     # Non-blocking recv: should return 6 bytes immediately, then EAGAIN.
     var rbuf = List[UInt8](length=128, fill=0)
-    var got = recv(b, rbuf.unsafe_ptr(), 128, Int32(0))
+    var got = sys_recv(b, rbuf.unsafe_ptr(), 128, 0)
     check(got == 6, "recv returned 6")
     var as_string = String("")
     for i in range(6):
         as_string += chr(Int(rbuf[i]))
     check(as_string == "epoll!", "recv contents")
-    var again = recv(b, rbuf.unsafe_ptr(), 128, Int32(0x40))  # MSG_DONTWAIT
-    check(again == -1, "second recv blocks (would-be EAGAIN under DONTWAIT)")
+    var again = sys_recv(b, rbuf.unsafe_ptr(), 128, MSG_DONTWAIT)
+    check(again == -11, "second recv would block (EAGAIN)")
 
     # modify: switch the registration to writable only, then verify
     # epoll reports it as writable immediately (the socket has room).
@@ -59,8 +69,8 @@ def run() raises:
     check(events2[0].is_writable(), "fd is writable")
 
     poller.unregister(b)
-    _ = close(a)
-    _ = close(b)
+    _ = sys_close(a)
+    _ = sys_close(b)
     print("test_poller: OK")
 
 

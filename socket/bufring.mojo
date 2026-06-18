@@ -1,27 +1,30 @@
 # Provided buffer ring (IORING_REGISTER_PBUF_RING): a pool of receive
 # buffers the KERNEL picks from at completion time. Multishot recv
-# plus this pool is the steady state of a busy server — one armed SQE
-# per connection and zero per-read buffer management.
+# plus this pool is the steady state of a busy server — one armed
+# SQE per connection and zero per-read buffer management.
 #
 # Memory model: the pool owns both the ring of io_uring_buf
 # descriptors (16 bytes each: addr u64, len u32, bid u16, resv u16;
 # the ring tail overlays byte 14 of entry 0) and the flat backing
 # storage. A completion borrows buffer `bid`; the consumer reads
-# `view(bid, len)` and MUST `recycle(bid)` afterwards to return it to
-# the kernel. Unrecycled buffers eventually starve the pool — recv
-# completions then fail with -ENOBUFS, which the Ring surfaces.
+# `view(bid, len)` and MUST `recycle(bid)` afterwards to return it
+# to the kernel. Unrecycled buffers eventually starve the pool —
+# recv completions then fail with -ENOBUFS, which the Ring surfaces.
 
 from std.atomic import Atomic
-from std.ffi import external_call
 from std.memory import UnsafePointer
 
-from socket.uring_sys import (
-    REGISTER_PBUF_RING,
-    SYS_IO_URING_REGISTER,
-    UNREGISTER_PBUF_RING,
-    _mmap,
-    _syscall,
+from socket._syscalls import (
+    MAP_ANONYMOUS,
+    MAP_PRIVATE,
+    PROT_READ,
+    PROT_WRITE,
+    SYS_io_uring_register,
+    sys_mmap_or_raise,
+    sys_munmap,
+    syscall,
 )
+from socket.uring_sys import REGISTER_PBUF_RING, UNREGISTER_PBUF_RING
 
 
 struct BufRing(Movable):
@@ -45,13 +48,16 @@ struct BufRing(Movable):
         self.ring_fd = ring_fd
         self.ring_bytes = entries * 16
         var pages = (self.ring_bytes + 4095) & ~4095
-        # MAP_PRIVATE | MAP_ANONYMOUS
-        self.ring_mem = _mmap(pages, 3, 0x22, Int32(-1), 0)
-        # mmap signals failure with MAP_FAILED == (void*)-1, never NULL.
-        if Int(self.ring_mem) == -1:
-            raise Error("socket.bufring: mmap ring failed")
-        # The kernel fills these buffers on recv; allocate uninitialized
-        # rather than paying a full zero-fill the kernel overwrites.
+        self.ring_mem = sys_mmap_or_raise(
+            pages,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            Int32(-1),
+            0,
+        )
+        # The kernel fills these buffers on recv; allocate
+        # uninitialized rather than paying a full zero-fill the
+        # kernel overwrites.
         self.backing = List[UInt8](capacity=entries * buf_size)
         self.backing.resize(unsafe_uninit_length=entries * buf_size)
         var bp = self.backing.unsafe_ptr()
@@ -71,14 +77,12 @@ struct BufRing(Movable):
         reg.unsafe_ptr().bitcast[UInt64]()[0] = UInt64(Int(self.ring_mem))
         (reg.unsafe_ptr() + 8).bitcast[UInt32]()[0] = UInt32(entries)
         (reg.unsafe_ptr() + 12).bitcast[UInt16]()[0] = bgid
-        var rc = _syscall(
-            SYS_IO_URING_REGISTER,
+        var rc = syscall(
+            SYS_io_uring_register,
             Int(ring_fd),
             REGISTER_PBUF_RING,
             Int(reg.unsafe_ptr()),
             1,
-            0,
-            0,
         )
         if rc < 0:
             raise Error(
@@ -89,18 +93,16 @@ struct BufRing(Movable):
     def __del__(deinit self):
         var reg = List[UInt8](length=40, fill=0)
         (reg.unsafe_ptr() + 12).bitcast[UInt16]()[0] = self.bgid
-        _ = _syscall(
-            SYS_IO_URING_REGISTER,
+        _ = syscall(
+            SYS_io_uring_register,
             Int(self.ring_fd),
             UNREGISTER_PBUF_RING,
             Int(reg.unsafe_ptr()),
             1,
-            0,
-            0,
         )
         _ = reg[0]
         var pages = (self.ring_bytes + 4095) & ~4095
-        _ = external_call["munmap", Int32](self.ring_mem, pages)
+        _ = sys_munmap(self.ring_mem, pages)
 
     @always_inline
     def view(mut self, bid: Int, length: Int) -> Span[UInt8, MutAnyOrigin]:

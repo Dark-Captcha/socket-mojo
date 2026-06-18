@@ -1,5 +1,5 @@
 [workspace]
-authors = ["luanon404 <luanon404@gmail.com>"]
+authors = ["GnU-Chan <gnusocute@gmail.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "socket-mojo"
 platforms = ["linux-64"]
@@ -10,4 +10,5 @@ test = "mojo run -I . tests/run_tests.mojo"
 bench = "mojo run -I . benchmarks/bench.mojo"
 
 [dependencies]
-mojo-compiler = "==1.0.0b2.dev2026061006"
+mojo-compiler = "==1.0.0b3.dev2026061706"
+mblack = "==26.5.0.dev2026061706"

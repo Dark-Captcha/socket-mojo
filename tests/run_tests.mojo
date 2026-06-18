@@ -12,9 +12,10 @@ import tests.test_addr
 import tests.test_dns
 import tests.test_dns_ring
 import tests.test_poller
+import tests.test_ring
+import tests.test_ring_direct
 import tests.test_tcp
 import tests.test_tcp_dns
-import tests.test_ring
 import tests.test_udp
 
 
@@ -26,5 +27,6 @@ def main() raises:
     tests.test_tcp_dns.run()
     tests.test_poller.run()
     tests.test_ring.run()
+    tests.test_ring_direct.run()
     tests.test_dns_ring.run()
     print("ALL SOCKET TESTS PASSED")

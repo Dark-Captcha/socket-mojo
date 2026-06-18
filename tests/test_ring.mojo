@@ -8,19 +8,18 @@
 #    (tests/echo_server.py — the same one-shot peer the tcp tests
 #    use, on its own port) and verify the echo through Ring ops.
 
-from socket._libc import (
+from socket._syscalls import (
     AF_INET,
+    SOCK_CLOEXEC,
     SOCK_STREAM,
+    SOCKADDR_STORAGE_SIZE,
     SOL_SOCKET,
     SO_REUSEADDR,
-    SOCKADDR_STORAGE_SIZE,
-    bind as libc_bind,
-    close as libc_close,
-    errno,
     errno_message,
-    listen as libc_listen,
-    setsockopt,
-    socket as libc_socket,
+    sys_bind,
+    sys_listen,
+    sys_setsockopt,
+    sys_socket,
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
@@ -43,25 +42,35 @@ from std.memory import UnsafePointer
 from tests.helpers import check
 
 
+def _client_sock() raises -> Int32:
+    var rc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if rc < 0:
+        raise Error("test_ring: socket() " + errno_message(Int32(-rc)))
+    return Int32(rc)
+
+
 def _listening_socket(port: UInt16) raises -> Int32:
-    var fd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
-    if fd < 0:
-        raise Error("test_ring: socket() " + errno_message(errno()))
+    var rc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if rc < 0:
+        raise Error("test_ring: socket() " + errno_message(Int32(-rc)))
+    var fd = Int32(rc)
     var one = Int32(1)
-    _ = setsockopt(
+    _ = sys_setsockopt(
         fd,
-        Int32(SOL_SOCKET),
-        Int32(SO_REUSEADDR),
+        SOL_SOCKET,
+        SO_REUSEADDR,
         UnsafePointer(to=one).bitcast[UInt8](),
         4,
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
-    if libc_bind(fd, sa.unsafe_ptr(), alen) != 0:
-        raise Error("test_ring: bind() " + errno_message(errno()))
-    if libc_listen(fd, 8) != 0:
-        raise Error("test_ring: listen() " + errno_message(errno()))
+    var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
+    if brc != 0:
+        raise Error("test_ring: bind() " + errno_message(Int32(-brc)))
+    var lrc = sys_listen(fd, 8)
+    if lrc != 0:
+        raise Error("test_ring: listen() " + errno_message(Int32(-lrc)))
     return fd
 
 
@@ -89,8 +98,7 @@ def _test_loopback_echo() raises:
     var ring = Ring(64)
     var port = UInt16(19612)
     var lfd = _listening_socket(port)
-    var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
-    check(cfd >= 0, "ring: client socket created")
+    var cfd = _client_sock()
 
     var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
     var accept_op = ring.accept(lfd)
@@ -172,7 +180,7 @@ def _test_external_echo() raises:
     # python tests/echo_server.py 19503 must be running (same
     # convention as test_tcp.mojo, dedicated port).
     var ring = Ring(32)
-    var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+    var cfd = _client_sock()
     var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), UInt16(19503))
     _ = ring.connect(cfd, dest)
     _ = ring.wait(min_complete=1)
@@ -220,7 +228,7 @@ def _test_multishot_and_buffers() raises:
     var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
     var clients = List[Int32]()
     for _ in range(3):
-        var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+        var cfd = _client_sock()
         _ = ring.connect(cfd, dest)
         clients.append(cfd)
     _ = ring.wait(min_complete=6)  # 3 connects + 3 multishot accepts
@@ -322,7 +330,7 @@ def _test_timers() raises:
     # recv deadline on a silent connection
     var port = UInt16(19614)
     var lfd = _listening_socket(port)
-    var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+    var cfd = _client_sock()
     _ = ring.connect(cfd, SocketAddr(IpAddress.v4(127, 0, 0, 1), port))
     var acc = ring.accept(lfd)
     _ = ring.wait(min_complete=2)
@@ -334,15 +342,19 @@ def _test_timers() raises:
         if dd.op == acc:
             afd = dd.res
     _ = ring.recv_with_timeout(afd, 128, 40_000_000)  # nobody sends
+    # The kernel delivers two CQEs (the recv and its link-timeout
+    # partner), but the engine swallows the partner. Wait for both
+    # so the kernel doesn't carry one over and confuse the close
+    # path below, then expect exactly ONE user-visible completion.
     _ = ring.wait(min_complete=2)
-    var got_cancel = False
-    for _ in range(2):
-        var cc = ring.next_completion()
-        var dd = cc.take()
-        if dd.kind == KIND_RECV:
-            check(dd.res == -125, "m1: recv deadline ECANCELED")
-            got_cancel = True
-    check(got_cancel, "m1: recv-with-timeout expired")
+    var cc = ring.next_completion()
+    var dd = cc.take()
+    check(dd.kind == KIND_RECV, "m1: recv-with-timeout user kind")
+    check(dd.res == -125, "m1: recv deadline ECANCELED")
+    check(
+        Bool(not ring.next_completion()),
+        "m1: link-timeout partner drained internally",
+    )
     _ = ring.close_fd(cfd)
     _ = ring.close_fd(afd)
     _ = ring.close_fd(lfd)

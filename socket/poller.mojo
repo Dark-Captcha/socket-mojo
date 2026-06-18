@@ -1,5 +1,5 @@
 # epoll(7) reactor. Tier-2 of the socket-mojo concurrency plan: one
-# thread, many non-blocking sockets, single epoll_wait syscall per
+# thread, many non-blocking sockets, single epoll_pwait syscall per
 # event burst.
 #
 # Usage shape:
@@ -18,7 +18,7 @@
 
 from std.memory import UnsafePointer
 
-from socket._libc import (
+from socket._syscalls import (
     EPOLLERR,
     EPOLLET,
     EPOLLHUP,
@@ -30,12 +30,12 @@ from socket._libc import (
     EPOLL_CTL_DEL,
     EPOLL_CTL_MOD,
     EPOLL_EVENT_SIZE,
-    close,
-    epoll_create1,
-    epoll_ctl,
-    epoll_wait,
-    errno,
+    O_CLOEXEC,
     errno_message,
+    sys_close,
+    sys_epoll_create1,
+    sys_epoll_ctl,
+    sys_epoll_pwait,
 )
 
 
@@ -72,9 +72,10 @@ def _write_event(
     events: UInt32,
     fd: Int32,
 ):
-    """Serialize a `struct epoll_event` (packed on x86-64): u32 events
-    at offset 0, then the data union (u64) at offset 4. We stash the
-    fd in the low 32 bits of data so the wait loop can recover it."""
+    """Serialize a `struct epoll_event` (packed on x86-64): u32
+    events at offset 0, then the data union (u64) at offset 4. We
+    stash the fd in the low 32 bits of data so the wait loop can
+    recover it."""
     for k in range(EPOLL_EVENT_SIZE):
         out_ptr[k] = 0
     out_ptr[0] = UInt8(events & 0xFF)
@@ -114,20 +115,20 @@ struct Poller(Movable):
 
     def __del__(deinit self):
         if self.epfd >= 0:
-            _ = close(self.epfd)
+            _ = sys_close(self.epfd)
 
     @staticmethod
     def open() raises -> Poller:
-        var fd = epoll_create1(Int32(0))
-        if fd < 0:
+        var rc = sys_epoll_create1(O_CLOEXEC)
+        if rc < 0:
             raise Error(
-                "socket.poller: epoll_create1 " + errno_message(errno())
+                "socket.poller: epoll_create1 " + errno_message(Int32(-rc))
             )
-        return Poller(fd)
+        return Poller(Int32(rc))
 
     def _ctl(
         mut self,
-        op: Int32,
+        op: Int,
         fd: Int32,
         *,
         readable: Bool,
@@ -149,9 +150,11 @@ struct Poller(Movable):
             events |= UInt32(EPOLLONESHOT)
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
         _write_event(ev.unsafe_ptr(), events, fd)
-        var rv = epoll_ctl(self.epfd, op, fd, ev.unsafe_ptr())
+        var rv = sys_epoll_ctl(self.epfd, op, fd, ev.unsafe_ptr())
         if rv != 0:
-            raise Error("socket.poller: epoll_ctl " + errno_message(errno()))
+            raise Error(
+                "socket.poller: epoll_ctl " + errno_message(Int32(-rv))
+            )
 
     def register(
         mut self,
@@ -163,10 +166,10 @@ struct Poller(Movable):
         oneshot: Bool = False,
         rdhup: Bool = True,
     ) raises:
-        """Start watching `fd`. RDHUP is on by default so callers learn
-        about peer half-closes promptly."""
+        """Start watching `fd`. RDHUP is on by default so callers
+        learn about peer half-closes promptly."""
         self._ctl(
-            Int32(EPOLL_CTL_ADD),
+            EPOLL_CTL_ADD,
             fd,
             readable=readable,
             writable=writable,
@@ -189,7 +192,7 @@ struct Poller(Movable):
         for a TLS handshake that needs `writable` during the SYN and
         `readable` once established."""
         self._ctl(
-            Int32(EPOLL_CTL_MOD),
+            EPOLL_CTL_MOD,
             fd,
             readable=readable,
             writable=writable,
@@ -202,10 +205,13 @@ struct Poller(Movable):
         # epoll_ctl(EPOLL_CTL_DEL) ignores the event argument; pass a
         # zeroed buffer.
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
-        var rv = epoll_ctl(self.epfd, Int32(EPOLL_CTL_DEL), fd, ev.unsafe_ptr())
+        var rv = sys_epoll_ctl(
+            self.epfd, EPOLL_CTL_DEL, fd, ev.unsafe_ptr()
+        )
         if rv != 0:
             raise Error(
-                "socket.poller: epoll_ctl(DEL) " + errno_message(errno())
+                "socket.poller: epoll_ctl(DEL) "
+                + errno_message(Int32(-rv))
             )
 
     def wait(
@@ -216,16 +222,16 @@ struct Poller(Movable):
         means wait indefinitely. `timeout_ms = 0` is a non-blocking
         poll."""
         var buf = List[UInt8](length=EPOLL_EVENT_SIZE * max_events, fill=0)
-        var n = epoll_wait(
-            self.epfd, buf.unsafe_ptr(), Int32(max_events), Int32(timeout_ms)
+        var n = sys_epoll_pwait(
+            self.epfd, buf.unsafe_ptr(), max_events, timeout_ms
         )
         if n < 0:
-            var e = errno()
-            if e == 4:  # EINTR — treat as a timeout-with-no-events
+            if n == -4:  # EINTR — treat as a timeout-with-no-events
                 return List[PollEvent]()
-            raise Error("socket.poller: epoll_wait " + errno_message(e))
-        var n_int = Int(n)
-        var out = List[PollEvent](capacity=n_int)
-        for i in range(n_int):
+            raise Error(
+                "socket.poller: epoll_pwait " + errno_message(Int32(-n))
+            )
+        var out = List[PollEvent](capacity=n)
+        for i in range(n):
             out.append(_read_event(buf.unsafe_ptr(), i * EPOLL_EVENT_SIZE))
         return out^

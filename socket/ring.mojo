@@ -1,15 +1,18 @@
 # The completion engine: a safe operation table over UringQueue.
 #
-# Lifetime rule (learned the hard way — see .probe/SYNTAX.md): every
-# byte of memory the kernel can read or write for an in-flight
-# operation is OWNED BY THE OPERATION'S SLOT until its completion is
-# reaped. Callers hand buffers in (send) and take buffers out (recv
-# completions); they never share memory with the kernel. Mojo's ASAP
-# destruction therefore cannot free anything the kernel still sees.
+# Lifetime rule: every byte of memory the kernel can read or write
+# for an in-flight operation is OWNED BY THE OPERATION'S SLOT until
+# its completion is reaped. Callers hand buffers in (send) and take
+# buffers out (recv completions); they never share memory with the
+# kernel. Mojo's ASAP destruction therefore cannot free anything the
+# kernel still sees.
 #
-# user_data packing: slot index (32 bits) | generation (16) | kind (8).
+# user_data packing: slot index (32 bits) | generation (24) | kind (8).
 # Generations make completions of recycled slots detectable; the
 # engine raises on a stale generation instead of misrouting it.
+# 24-bit generation = 16M cycles before wrap; a slot would have to
+# recycle that many times within the lifetime of a still-in-flight
+# CQE for the ABA window to close.
 #
 # Usage shape (M0, single-shot ops):
 #   var ring = Ring(256)
@@ -23,7 +26,7 @@
 
 from std.memory import UnsafePointer, memcpy
 
-from socket._libc import (
+from socket._syscalls import (
     SOCKADDR_STORAGE_SIZE,
     errno_message,
     write_sockaddr,
@@ -31,12 +34,16 @@ from socket._libc import (
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.bufring import BufRing
+from socket._syscalls import SYS_io_uring_register, syscall
 from socket.uring_sys import (
     ACCEPT_MULTISHOT,
     CQE_BUFFER_SHIFT,
     CQE_F_BUFFER,
     CQE_F_MORE,
+    CQE_F_NOTIF,
+    FILE_INDEX_ALLOC,
     IOSQE_BUFFER_SELECT,
+    IOSQE_FIXED_FILE,
     IOSQE_IO_LINK,
     OP_ACCEPT,
     OP_ASYNC_CANCEL,
@@ -46,9 +53,13 @@ from socket.uring_sys import (
     OP_NOP,
     OP_RECV,
     OP_SEND,
+    OP_SEND_ZC,
     OP_SHUTDOWN,
+    OP_SOCKET,
     OP_TIMEOUT,
     RECV_MULTISHOT,
+    REGISTER_FILES,
+    UNREGISTER_FILES,
     UringQueue,
 )
 
@@ -63,6 +74,23 @@ comptime KIND_ACCEPT_MULTI = UInt8(7)
 comptime KIND_RECV_MULTI = UInt8(8)
 comptime KIND_TIMEOUT = UInt8(9)
 comptime KIND_CANCEL = UInt8(10)
+# A linked-timeout partner of a recv_with_timeout: the kernel always
+# posts its CQE, but the engine drains it internally — callers see
+# only the recv. Without this, forgetting to reap the partner leaks
+# both the slot and one inflight count.
+comptime KIND_TIMEOUT_LINKED = UInt8(11)
+# Registered fd table family. CQE.res for these is a *slot index*
+# in the registered table, not a kernel fd; downstream ops use that
+# slot with `fixed=True` (which sets IOSQE_FIXED_FILE on the SQE).
+comptime KIND_ACCEPT_DIRECT = UInt8(12)
+comptime KIND_ACCEPT_MULTI_DIRECT = UInt8(13)
+comptime KIND_SOCKET = UInt8(14)
+# OP_SEND_ZC posts TWO CQEs per submission — the "send done" one
+# (carries F_MORE; res = bytes sent) which the engine surfaces, and
+# the "buffer reusable" notif (F_NOTIF, no F_MORE) which the engine
+# drains. The slot stays alive across both so the user-passed
+# buffer survives the kernel's retransmit window.
+comptime KIND_SEND_ZC = UInt8(15)
 
 
 @always_inline
@@ -85,8 +113,18 @@ def _kind_name(kind: UInt8) -> String:
         return "recv-multishot"
     if kind == KIND_TIMEOUT:
         return "timeout"
+    if kind == KIND_TIMEOUT_LINKED:
+        return "timeout-linked"
     if kind == KIND_CANCEL:
         return "cancel"
+    if kind == KIND_ACCEPT_DIRECT:
+        return "accept-direct"
+    if kind == KIND_ACCEPT_MULTI_DIRECT:
+        return "accept-multishot-direct"
+    if kind == KIND_SOCKET:
+        return "socket-direct"
+    if kind == KIND_SEND_ZC:
+        return "send-zc"
     return "nop"
 
 
@@ -107,7 +145,8 @@ struct OpId(Copyable, ImplicitlyCopyable, Movable):
 
 struct _OpSlot(Movable):
     # Generation of the CURRENT (or next) occupant; bumped on free.
-    var gen: UInt16
+    # 24 bits used (masked on increment); 32-bit field for arithmetic.
+    var gen: UInt32
     var kind: UInt8
     var active: Bool
     var fd: Int32
@@ -174,8 +213,12 @@ struct Completion(Movable):
         return out^
 
     def accepted_peer(self) raises -> SocketAddr:
-        """For accept completions: the peer's address."""
-        if self.kind != KIND_ACCEPT or len(self.buf) < SOCKADDR_STORAGE_SIZE:
+        """For accept / accept_direct completions: the peer's address.
+        Multishot variants (KIND_ACCEPT_MULTI / _MULTI_DIRECT) don't
+        carry per-completion sockaddr — fetch via getpeername if
+        needed."""
+        var ok = self.kind == KIND_ACCEPT or self.kind == KIND_ACCEPT_DIRECT
+        if not ok or len(self.buf) < SOCKADDR_STORAGE_SIZE:
             raise Error("socket.ring: not an accept completion")
         var parsed = read_sockaddr(self.buf.unsafe_ptr())
         var ip = IpAddress(parsed[0], parsed[1])
@@ -195,8 +238,40 @@ struct Ring(Movable):
     var inflight: Int
     var bufs: Optional[BufRing]
 
-    def __init__(out self, entries: Int = 256) raises:
-        self.q = UringQueue(entries)
+    def __init__(
+        out self,
+        entries: Int = 256,
+        *,
+        sqpoll: Bool = False,
+        sqpoll_idle_ms: UInt32 = 1000,
+        single_issuer: Bool = False,
+        defer_taskrun: Bool = False,
+        coop_taskrun: Bool = False,
+    ) raises:
+        """Ring options:
+          * `sqpoll`           kernel SQ submission kthread — steady-
+                                state submit can collapse to ZERO
+                                syscalls. Linux 5.11+ unprivileged.
+          * `defer_taskrun`    defer completion task work until we
+                                wait() — best cache locality. Linux
+                                6.0+; implies single_issuer.
+          * `coop_taskrun`     run completions in the calling task
+                                (vs. random kernel threads). Linux
+                                5.19+.
+          * `single_issuer`    only one thread submits; the kernel
+                                drops several internal locks. Linux
+                                6.0+. Required by defer_taskrun.
+
+        Older kernels reject unknown flags with -EINVAL. Defaults are
+        OFF — opt in once you know your kernel."""
+        self.q = UringQueue(
+            entries,
+            sqpoll=sqpoll,
+            sqpoll_idle_ms=sqpoll_idle_ms,
+            single_issuer=single_issuer,
+            defer_taskrun=defer_taskrun,
+            coop_taskrun=coop_taskrun,
+        )
         self.slots = List[_OpSlot]()
         self.free = List[UInt32]()
         self.inflight = 0
@@ -238,6 +313,52 @@ struct Ring(Movable):
             raise Error("socket.ring: recycle_buffer bid out of range")
         self.bufs[].recycle(bid)
 
+    # --- registered fd table -----------------------------------------------
+
+    def register_files(mut self, count: Int) raises:
+        """Set up a sparse registered fd table of `count` slots. Once
+        registered, accept_direct / socket_direct allocate into the
+        table (kernel picks a free slot), and recv / send / close
+        with `fixed=True` reference table slots by index — skipping
+        the per-op fget refcount bump that raw fds pay."""
+        if count <= 0:
+            raise Error("socket.ring: register_files count must be > 0")
+        # IORING_REGISTER_FILES takes an array of __s32 fds; -1 means
+        # "empty slot, kernel allocates here later." 0xFF-fill makes
+        # every i32 read as -1.
+        var fds = List[UInt8](length=count * 4, fill=0xFF)
+        var rc = syscall(
+            SYS_io_uring_register,
+            Int(self.q.fd),
+            REGISTER_FILES,
+            Int(fds.unsafe_ptr()),
+            count,
+        )
+        if rc < 0:
+            raise Error(
+                "socket.ring: register_files failed (errno "
+                + String(-rc)
+                + ")"
+            )
+        _ = fds[0]  # keep alive past the kernel read
+
+    def unregister_files(mut self) raises:
+        """Tear down the registered fd table. Any direct fds become
+        invalid; callers should close_direct them first."""
+        var rc = syscall(
+            SYS_io_uring_register,
+            Int(self.q.fd),
+            UNREGISTER_FILES,
+            0,
+            0,
+        )
+        if rc < 0:
+            raise Error(
+                "socket.ring: unregister_files failed (errno "
+                + String(-rc)
+                + ")"
+            )
+
     # --- slot management --------------------------------------------------
 
     def _alloc(mut self, kind: UInt8, fd: Int32, var buf: List[UInt8]) -> Int:
@@ -257,8 +378,8 @@ struct Ring(Movable):
     def _user_data(self, idx: Int, kind: UInt8) -> UInt64:
         return (
             UInt64(idx)
-            | (UInt64(self.slots[idx].gen) << 32)
-            | (UInt64(kind) << 48)
+            | (UInt64(self.slots[idx].gen & 0xFFFFFF) << 32)
+            | (UInt64(kind) << 56)
         )
 
     def _room(mut self) raises:
@@ -291,7 +412,9 @@ struct Ring(Movable):
         self.inflight += 1
         return OpId(ud)
 
-    def connect(mut self, fd: Int32, addr: SocketAddr) raises -> OpId:
+    def connect(
+        mut self, fd: Int32, addr: SocketAddr, *, fixed: Bool = False
+    ) raises -> OpId:
         self._room()
         var st = List[UInt8](length=SOCKADDR_STORAGE_SIZE, fill=0)
         var alen = write_sockaddr(
@@ -300,11 +423,20 @@ struct Ring(Movable):
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
         var idx = self._alloc(KIND_CONNECT, fd, st^)
         var ud = self._user_data(idx, KIND_CONNECT)
-        self.q.push_sqe(OP_CONNECT, fd, addr_ptr, 0, UInt64(alen), 0, ud)
+        var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
+        self.q.push_sqe(
+            OP_CONNECT, fd, addr_ptr, 0, UInt64(alen), 0, ud, sqe_flags=sqe_flags
+        )
         self.inflight += 1
         return OpId(ud)
 
-    def recv(mut self, fd: Int32, max_bytes: Int) raises -> OpId:
+    def recv(
+        mut self, fd: Int32, max_bytes: Int, *, fixed: Bool = False
+    ) raises -> OpId:
+        """`fixed=True` interprets `fd` as a slot index in the
+        registered fd table (set up by register_files()) instead of
+        a raw kernel fd. The kernel skips the fget refcount bump
+        that a raw fd costs every op."""
         self._room()
         # Uninitialized: the kernel fills it; a zero-fill would be thrown
         # away on the next syscall.
@@ -313,32 +445,88 @@ struct Ring(Movable):
         var ptr = UInt64(Int(buf.unsafe_ptr()))
         var idx = self._alloc(KIND_RECV, fd, buf^)
         var ud = self._user_data(idx, KIND_RECV)
-        self.q.push_sqe(OP_RECV, fd, ptr, UInt32(max_bytes), 0, 0, ud)
+        var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
+        self.q.push_sqe(
+            OP_RECV,
+            fd,
+            ptr,
+            UInt32(max_bytes),
+            0,
+            0,
+            ud,
+            sqe_flags=sqe_flags,
+        )
         self.inflight += 1
         return OpId(ud)
 
-    def send(mut self, fd: Int32, var data: List[UInt8]) raises -> OpId:
-        """Takes ownership of `data` until the completion is reaped."""
+    def send(
+        mut self,
+        fd: Int32,
+        var data: List[UInt8],
+        *,
+        fixed: Bool = False,
+        zero_copy: Bool = False,
+    ) raises -> OpId:
+        """Takes ownership of `data` until the completion is reaped.
+        `fixed=True`: `fd` is a registered-table slot index.
+        `zero_copy=True`: use OP_SEND_ZC (the kernel keeps the buffer
+        pinned through its retransmit window; valuable when `data` is
+        large, typically >16 KiB). The slot owns `data` across both
+        the user-visible "send done" CQE and the hidden notif CQE so
+        the buffer remains valid until the kernel releases it."""
         self._room()
         var ptr = UInt64(Int(data.unsafe_ptr()))
         var n = len(data)
-        var idx = self._alloc(KIND_SEND, fd, data^)
-        var ud = self._user_data(idx, KIND_SEND)
+        var kind = KIND_SEND_ZC if zero_copy else KIND_SEND
+        var op = OP_SEND_ZC if zero_copy else OP_SEND
+        var idx = self._alloc(kind, fd, data^)
+        var ud = self._user_data(idx, kind)
+        var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
         # MSG_NOSIGNAL: a dead peer must surface as -EPIPE, not SIGPIPE
-        self.q.push_sqe(OP_SEND, fd, ptr, UInt32(n), 0, UInt32(0x4000), ud)
+        self.q.push_sqe(
+            op, fd, ptr, UInt32(n), 0, UInt32(0x4000), ud, sqe_flags=sqe_flags
+        )
         self.inflight += 1
         return OpId(ud)
 
-    def send_copy(mut self, fd: Int32, data: Span[UInt8, _]) raises -> OpId:
+    def send_copy(
+        mut self,
+        fd: Int32,
+        data: Span[UInt8, _],
+        *,
+        fixed: Bool = False,
+        zero_copy: Bool = False,
+    ) raises -> OpId:
         var owned = List[UInt8](capacity=len(data))
         owned.extend(data)
-        return self.send(fd, owned^)
+        return self.send(fd, owned^, fixed=fixed, zero_copy=zero_copy)
 
-    def close_fd(mut self, fd: Int32) raises -> OpId:
+    def close_fd(
+        mut self, fd: Int32, *, fixed: Bool = False
+    ) raises -> OpId:
+        """When `fixed=True`, closes a direct fd (releases the table
+        slot via sqe.file_index); the slot is available for
+        re-allocation immediately after this op is processed."""
         self._room()
         var idx = self._alloc(KIND_CLOSE, fd, List[UInt8]())
         var ud = self._user_data(idx, KIND_CLOSE)
-        self.q.push_sqe(OP_CLOSE, fd, 0, 0, 0, 0, ud)
+        if fixed:
+            # OP_CLOSE on a direct fd: the kernel rejects with EINVAL
+            # if both sqe.fd and sqe.file_index are non-zero, so the
+            # fd field must be 0 here. file_index = slot + 1 (1-based;
+            # 0 means "no slot").
+            self.q.push_sqe(
+                OP_CLOSE,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ud,
+                file_index=UInt32(fd) + UInt32(1),
+            )
+        else:
+            self.q.push_sqe(OP_CLOSE, fd, 0, 0, 0, 0, ud)
         self.inflight += 1
         return OpId(ud)
 
@@ -354,7 +542,8 @@ struct Ring(Movable):
         """One armed SQE that produces a completion per incoming
         connection until it terminates (completion with more=False).
         Peer addresses are not collected on this path — fetch them via
-        getpeername if a protocol needs them."""
+        getpeername if a protocol needs them, or use accept_direct
+        single-shots (which DO carry peer addresses)."""
         self._room()
         var idx = self._alloc(KIND_ACCEPT_MULTI, listen_fd, List[UInt8]())
         var ud = self._user_data(idx, KIND_ACCEPT_MULTI)
@@ -364,7 +553,87 @@ struct Ring(Movable):
         self.inflight += 1
         return OpId(ud)
 
-    def recv_multishot(mut self, fd: Int32) raises -> OpId:
+    def accept_direct(mut self, listen_fd: Int32) raises -> OpId:
+        """accept(2) where the new fd is allocated into the
+        registered fd table (set up via register_files() first). The
+        CQE.res carries the table SLOT INDEX, not a kernel fd.
+        Subsequent ops on that connection pass the slot index with
+        `fixed=True`; close_direct() releases the slot. Peer address
+        is collected as in the regular accept()."""
+        self._room()
+        var st = List[UInt8](length=SOCKADDR_STORAGE_SIZE + 4, fill=0)
+        st[SOCKADDR_STORAGE_SIZE] = UInt8(SOCKADDR_STORAGE_SIZE)
+        var addr_ptr = UInt64(Int(st.unsafe_ptr()))
+        var len_ptr = UInt64(Int(st.unsafe_ptr() + SOCKADDR_STORAGE_SIZE))
+        var idx = self._alloc(KIND_ACCEPT_DIRECT, listen_fd, st^)
+        var ud = self._user_data(idx, KIND_ACCEPT_DIRECT)
+        self.q.push_sqe(
+            OP_ACCEPT,
+            listen_fd,
+            addr_ptr,
+            0,
+            len_ptr,
+            0,
+            ud,
+            file_index=FILE_INDEX_ALLOC,
+        )
+        self.inflight += 1
+        return OpId(ud)
+
+    def accept_multishot_direct(mut self, listen_fd: Int32) raises -> OpId:
+        """Multishot accept that allocates each new fd directly into
+        the registered table — the steady-state shape of a busy
+        connection-oriented server. Each completion's res is a new
+        slot index; peer addresses are not collected (use
+        accept_direct for those)."""
+        self._room()
+        var idx = self._alloc(KIND_ACCEPT_MULTI_DIRECT, listen_fd, List[UInt8]())
+        var ud = self._user_data(idx, KIND_ACCEPT_MULTI_DIRECT)
+        self.q.push_sqe(
+            OP_ACCEPT,
+            listen_fd,
+            0,
+            0,
+            0,
+            0,
+            ud,
+            ioprio=ACCEPT_MULTISHOT,
+            file_index=FILE_INDEX_ALLOC,
+        )
+        self.inflight += 1
+        return OpId(ud)
+
+    def socket_direct(
+        mut self, domain: Int, type_: Int, protocol: Int
+    ) raises -> OpId:
+        """Create a socket whose fd lands in the registered table —
+        no userspace fd allocation at all. CQE.res is the table slot
+        index. Used to open client connections fully under the Ring
+        (followed by a connect on the same slot)."""
+        self._room()
+        var idx = self._alloc(KIND_SOCKET, -1, List[UInt8]())
+        var ud = self._user_data(idx, KIND_SOCKET)
+        # OP_SOCKET SQE encoding (io_uring/net.c):
+        #   sqe.fd     = domain
+        #   sqe.off    = type
+        #   sqe.len    = protocol
+        #   file_index = slot+1, or FILE_INDEX_ALLOC for "any free"
+        self.q.push_sqe(
+            OP_SOCKET,
+            Int32(domain),
+            0,
+            UInt32(protocol),
+            UInt64(type_),
+            0,
+            ud,
+            file_index=FILE_INDEX_ALLOC,
+        )
+        self.inflight += 1
+        return OpId(ud)
+
+    def recv_multishot(
+        mut self, fd: Int32, *, fixed: Bool = False
+    ) raises -> OpId:
         """One armed SQE that produces a buffer-carrying completion per
         arriving chunk, drawing from the registered pool. ANY completion
         with bid >= 0 — INCLUDING the terminal one (more == False) — owns
@@ -373,12 +642,16 @@ struct Ring(Movable):
         committing a buffer (res > 0, more == False) when the pool drains
         or the CQ overflows; skipping recycle there leaks that buffer and
         starves the pool toward -ENOBUFS. res == 0 means peer EOF (no
-        buffer, bid == -1); -ENOBUFS means the pool starved."""
+        buffer, bid == -1); -ENOBUFS means the pool starved.
+        `fixed=True`: `fd` is a registered-table slot index."""
         if not self.bufs:
             raise Error("socket.ring: setup_buffers() first")
         self._room()
         var idx = self._alloc(KIND_RECV_MULTI, fd, List[UInt8]())
         var ud = self._user_data(idx, KIND_RECV_MULTI)
+        var sqe_flags = IOSQE_BUFFER_SELECT
+        if fixed:
+            sqe_flags |= IOSQE_FIXED_FILE
         self.q.push_sqe(
             OP_RECV,
             fd,
@@ -387,7 +660,7 @@ struct Ring(Movable):
             0,
             0,
             ud,
-            sqe_flags=IOSQE_BUFFER_SELECT,
+            sqe_flags=sqe_flags,
             ioprio=RECV_MULTISHOT,
             buf_group=self.bufs.value().bgid,
         )
@@ -415,13 +688,10 @@ struct Ring(Movable):
         """Recv bounded by a linked deadline: the recv fails with
         -ECANCELED if no data arrives in time.
 
-        NOTE: this queues TWO operations and posts TWO completions — the
-        recv (KIND_RECV: bytes, or -ECANCELED on the deadline) AND its
-        linked timeout (KIND_TIMEOUT: -ETIME if it fired, -ECANCELED if
-        the recv finished first). Callers MUST reap BOTH completions to
-        release both slots and bring inflight back down by 2; reaping
-        only the returned KIND_RECV OpId leaks one slot and one inflight
-        count."""
+        The linked-timeout partner CQE the kernel posts is drained
+        inside the engine (kind KIND_TIMEOUT_LINKED); the caller sees
+        exactly ONE completion for the returned OpId — the recv,
+        carrying either bytes or -ECANCELED."""
         self._room()
         if self.q.sq_space() < 2:
             _ = self.q.enter(0)
@@ -453,11 +723,11 @@ struct Ring(Movable):
             ud,
             sqe_flags=IOSQE_IO_LINK,
         )
-        # The linked timeout posts its OWN KIND_TIMEOUT completion (-ETIME
-        # if it fired, -ECANCELED if the recv completed first); it is
-        # fully identified and must be reaped like any other completion.
-        var tidx = self._alloc(KIND_TIMEOUT, -1, List[UInt8]())
-        var tud = self._user_data(tidx, KIND_TIMEOUT)
+        # The linked timeout still gets a CQE (one of -ETIME if it
+        # fired or -ECANCELED if recv won the race), but we tag it
+        # KIND_TIMEOUT_LINKED so next_completion() drops it silently.
+        var tidx = self._alloc(KIND_TIMEOUT_LINKED, -1, List[UInt8]())
+        var tud = self._user_data(tidx, KIND_TIMEOUT_LINKED)
         self.q.push_sqe(OP_LINK_TIMEOUT, -1, ts_ptr, 1, 0, 0, tud)
         self.inflight += 2
         return OpId(ud)
@@ -488,45 +758,82 @@ struct Ring(Movable):
         """Pops one completion if available; None when the CQ is
         drained. Slot buffers move into the Completion here. A
         multishot completion with more=True leaves its op armed (the
-        slot stays live); the terminal one (more=False) releases it."""
-        if not self.q.cqe_pending():
-            return None
-        var cqe = self.q.pop_cqe()
-        var idx = Int(cqe.user_data & 0xFFFFFFFF)
-        var gen = UInt16((cqe.user_data >> 32) & 0xFFFF)
-        var kind = UInt8((cqe.user_data >> 48) & 0xFF)
-        if idx >= len(self.slots) or not self.slots[idx].active:
-            raise Error("socket.ring: completion for unknown slot")
-        if self.slots[idx].gen != gen:
-            raise Error("socket.ring: completion for stale generation")
-        var more = (cqe.flags & CQE_F_MORE) != 0
-        var bid = -1
-        if (cqe.flags & CQE_F_BUFFER) != 0:
-            bid = Int(cqe.flags >> UInt32(CQE_BUFFER_SHIFT))
-        var fd = self.slots[idx].fd
-        if more:
-            # armed multishot: the slot (and any owned memory) lives on
+        slot stays live); the terminal one (more=False) releases it.
+        KIND_TIMEOUT_LINKED CQEs (the partner of a recv_with_timeout)
+        are drained internally — they release their slot and we loop
+        to the next CQE without surfacing them."""
+        while True:
+            if not self.q.cqe_pending():
+                return None
+            var cqe = self.q.pop_cqe()
+            var idx = Int(cqe.user_data & 0xFFFFFFFF)
+            var gen = UInt32((cqe.user_data >> 32) & 0xFFFFFF)
+            var kind = UInt8((cqe.user_data >> 56) & 0xFF)
+            if idx >= len(self.slots) or not self.slots[idx].active:
+                raise Error("socket.ring: completion for unknown slot")
+            if (self.slots[idx].gen & 0xFFFFFF) != gen:
+                raise Error("socket.ring: completion for stale generation")
+            var more = (cqe.flags & CQE_F_MORE) != 0
+            var notif = (cqe.flags & CQE_F_NOTIF) != 0
+            var bid = -1
+            if (cqe.flags & CQE_F_BUFFER) != 0:
+                bid = Int(cqe.flags >> UInt32(CQE_BUFFER_SHIFT))
+            var fd = self.slots[idx].fd
+            # SEND_ZC two-CQE protocol: F_MORE on the first CQE
+            # (the send result) and F_NOTIF on the second (the
+            # "buffer is reusable" notif). Engine surfaces the
+            # result, drains the notif silently, keeps the slot
+            # alive across both so the buffer remains pinned for
+            # the kernel's retransmit window.
+            if kind == KIND_SEND_ZC:
+                if more:
+                    return Completion(
+                        OpId(cqe.user_data),
+                        kind,
+                        fd,
+                        cqe.res,
+                        List[UInt8](),
+                        -1,
+                        False,
+                    )
+                if notif:
+                    self.slots[idx].active = False
+                    self.slots[idx].gen += 1
+                    self.free.append(UInt32(idx))
+                    self.inflight -= 1
+                    continue
+                # Error-only single CQE: fall through to normal release.
+            elif more:
+                # armed multishot: the slot (and any owned memory) lives on
+                return Completion(
+                    OpId(cqe.user_data),
+                    kind,
+                    fd,
+                    cqe.res,
+                    List[UInt8](),
+                    bid,
+                    True,
+                )
+            # Linked-timeout partner: release the slot and loop. The
+            # caller never sees this CQE — they see only the recv's.
+            if kind == KIND_TIMEOUT_LINKED:
+                self.slots[idx].active = False
+                self.slots[idx].gen += 1
+                self.free.append(UInt32(idx))
+                self.inflight -= 1
+                continue
+            var buf = List[UInt8]()
+            swap(buf, self.slots[idx].buf)
+            # recycle the slot
+            self.slots[idx].active = False
+            self.slots[idx].gen += 1
+            self.free.append(UInt32(idx))
+            self.inflight -= 1
+            # recv: truncate the buffer to what actually arrived
+            if kind == KIND_RECV and cqe.res > 0 and Int(cqe.res) < len(buf):
+                buf.shrink(Int(cqe.res))
+            if kind == KIND_RECV and cqe.res <= 0:
+                buf.shrink(0)
             return Completion(
-                OpId(cqe.user_data),
-                kind,
-                fd,
-                cqe.res,
-                List[UInt8](),
-                bid,
-                True,
+                OpId(cqe.user_data), kind, fd, cqe.res, buf^, bid, False
             )
-        var buf = List[UInt8]()
-        swap(buf, self.slots[idx].buf)
-        # recycle the slot
-        self.slots[idx].active = False
-        self.slots[idx].gen += 1
-        self.free.append(UInt32(idx))
-        self.inflight -= 1
-        # recv: truncate the buffer to what actually arrived
-        if kind == KIND_RECV and cqe.res > 0 and Int(cqe.res) < len(buf):
-            buf.shrink(Int(cqe.res))
-        if kind == KIND_RECV and cqe.res <= 0:
-            buf.shrink(0)
-        return Completion(
-            OpId(cqe.user_data), kind, fd, cqe.res, buf^, bid, False
-        )

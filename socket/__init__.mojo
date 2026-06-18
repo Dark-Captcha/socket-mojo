@@ -1,10 +1,22 @@
-# socket-mojo: pure-Mojo blocking TCP + UDP sockets over libc syscalls.
+# socket-mojo: a pure-Mojo socket stack over direct Linux syscalls
+# and io_uring.
 #
-# This v0 layer provides the byte-stream interface that the TLS, HTTP,
-# and QUIC layers build on top of. Blocking-only here; the same public
-# API is preserved when later versions add epoll / io_uring backends.
+# No libc-specific symbols: every kernel interaction goes through
+# socket/_syscalls.mojo, which calls the kernel via the `syscall`
+# instruction (currently through libc's variadic `syscall(3)` shim —
+# five lines of register loading we'd otherwise inline as asm). No
+# errno TLS slot. No getaddrinfo / glibc resolver. No liburing.
 #
-# No external library dependencies — only libc/kernel syscalls
-# (`socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`,
-# `recvfrom`, `sendto`, `setsockopt`, `close`, `getaddrinfo`,
-# `freeaddrinfo`, `__errno_location`).
+# Layers (Linux-first; portable to Windows IOCP later via the same
+# completion-shaped API on a Windows backend):
+#
+#   socket/addr.mojo      pure value types (IpAddress, SocketAddr)
+#   socket/dnswire.mojo   sans-io RFC 1035 codec
+#   socket/dns.mojo       /etc/hosts + /etc/resolv.conf + DNS via Ring
+#   socket/tcp.mojo       blocking TcpSocket / TcpListener
+#   socket/udp.mojo       blocking UdpSocket
+#   socket/poller.mojo    epoll(7) reactor (tier-2 fallback)
+#   socket/nonblocking.mojo  O_NONBLOCK helpers
+#   socket/uring_sys.mojo io_uring raw layer (mmap'd rings, SQEs/CQEs)
+#   socket/bufring.mojo   provided-buffer rings (multishot recv pool)
+#   socket/ring.mojo      Ring: safe completion engine — THE CORE

@@ -5,69 +5,89 @@
 #
 # Run: pixi run mojo run -I . benchmarks/bench_ring.mojo
 
+from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 
-from socket._libc import (
+from socket._syscalls import (
     AF_INET,
+    MSG_DONTWAIT,
+    MSG_NOSIGNAL,
+    SOCK_CLOEXEC,
     SOCK_STREAM,
+    SOCKADDR_STORAGE_SIZE,
     SOL_SOCKET,
     SO_REUSEADDR,
-    SOCKADDR_STORAGE_SIZE,
-    bind as libc_bind,
-    close as libc_close,
-    connect as libc_connect,
-    errno,
     errno_message,
-    listen as libc_listen,
-    recv as libc_recv,
-    send as libc_send,
-    setsockopt,
-    socket as libc_socket,
+    sys_accept4,
+    sys_bind,
+    sys_close,
+    sys_connect,
+    sys_getsockname,
+    sys_listen,
+    sys_recv,
+    sys_send,
+    sys_setsockopt,
+    sys_socket,
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.nonblocking import set_nonblocking
 from socket.poller import Poller
-from socket.ring import KIND_RECV, KIND_RECV_MULTI, KIND_SEND, Ring
+from socket.ring import (
+    KIND_ACCEPT_DIRECT,
+    KIND_RECV,
+    KIND_RECV_MULTI,
+    KIND_SEND,
+    Ring,
+)
 
 
 def _pair(port: UInt16) raises -> Tuple[Int32, Int32]:
     """(accepted_fd, client_fd) over loopback, blocking handshake.
     `port` is a hint; bind picks an ephemeral port if `port == 0`."""
-    var lfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
+    var lrc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if lrc < 0:
+        raise Error("bench: socket " + errno_message(Int32(-lrc)))
+    var lfd = Int32(lrc)
     var one = Int32(1)
-    _ = setsockopt(
+    _ = sys_setsockopt(
         lfd,
-        Int32(SOL_SOCKET),
-        Int32(SO_REUSEADDR),
+        SOL_SOCKET,
+        SO_REUSEADDR,
         UnsafePointer(to=one).bitcast[UInt8](),
         4,
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
-    if libc_bind(lfd, sa.unsafe_ptr(), alen) != 0:
-        raise Error("bench: bind " + errno_message(errno()))
+    var brc = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
+    if brc != 0:
+        raise Error("bench: bind " + errno_message(Int32(-brc)))
     # if port == 0 the kernel picked; pull it back into `sa` for connect
     if port == 0:
         var got = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var glen = UInt32(SOCKADDR_STORAGE_SIZE)
-        _ = external_call["getsockname", Int32](
-            lfd, got.unsafe_ptr(), UnsafePointer(to=glen)
-        )
+        _ = sys_getsockname(lfd, got.unsafe_ptr(), UnsafePointer(to=glen))
         sa[2] = got[2]
         sa[3] = got[3]
-    _ = libc_listen(lfd, 1)
-    var cfd = libc_socket(Int32(AF_INET), Int32(SOCK_STREAM), Int32(0))
-    if libc_connect(cfd, sa.unsafe_ptr(), alen) != 0:
-        raise Error("bench: connect " + errno_message(errno()))
-    var afd = external_call["accept", Int32](lfd, UInt(0), UInt(0))
-    _ = libc_close(lfd)
+    _ = sys_listen(lfd, 1)
+    var crc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if crc < 0:
+        raise Error("bench: socket " + errno_message(Int32(-crc)))
+    var cfd = Int32(crc)
+    var concrc = sys_connect(cfd, sa.unsafe_ptr(), Int(alen))
+    if concrc != 0:
+        raise Error("bench: connect " + errno_message(Int32(-concrc)))
+    var alen2 = UInt32(SOCKADDR_STORAGE_SIZE)
+    var asa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
+    var afdrc = sys_accept4(
+        lfd, asa.unsafe_ptr(), UnsafePointer(to=alen2), SOCK_CLOEXEC
+    )
+    if afdrc < 0:
+        raise Error("bench: accept " + errno_message(Int32(-afdrc)))
+    var afd = Int32(afdrc)
+    _ = sys_close(lfd)
     return (afd, cfd)
-
-
-from std.ffi import external_call
-from std.memory import UnsafePointer
 
 
 def _bench_blocking(msg_size: Int, rounds: Int) raises -> Float64:
@@ -78,23 +98,23 @@ def _bench_blocking(msg_size: Int, rounds: Int) raises -> Float64:
     var buf = List[UInt8](length=msg_size, fill=0)
     var t0 = perf_counter_ns()
     for _ in range(rounds):
-        _ = libc_send(cfd, msg.unsafe_ptr(), msg_size, Int32(0x4000))
+        _ = sys_send(cfd, msg.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         var got = 0
         while got < msg_size:
-            var n = libc_recv(
-                afd, buf.unsafe_ptr() + got, msg_size - got, Int32(0)
+            var n = sys_recv(
+                afd, buf.unsafe_ptr() + got, msg_size - got, 0
             )
             got += Int(n)
-        _ = libc_send(afd, buf.unsafe_ptr(), msg_size, Int32(0x4000))
+        _ = sys_send(afd, buf.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         got = 0
         while got < msg_size:
-            var n = libc_recv(
-                cfd, buf.unsafe_ptr() + got, msg_size - got, Int32(0)
+            var n = sys_recv(
+                cfd, buf.unsafe_ptr() + got, msg_size - got, 0
             )
             got += Int(n)
     var t1 = perf_counter_ns()
-    _ = libc_close(afd)
-    _ = libc_close(cfd)
+    _ = sys_close(afd)
+    _ = sys_close(cfd)
     return Float64(rounds) / (Float64(t1 - t0) / 1e9)
 
 
@@ -139,12 +159,15 @@ def _bench_ring_single(msg_size: Int, rounds: Int) raises -> Float64:
 
 
 def _bench_ring_fanout(
-    msg_size: Int, rounds: Int, conns: Int
+    msg_size: Int, rounds: Int, conns: Int, *, sqpoll: Bool = False
 ) raises -> Float64:
     # The shape io_uring is actually built for: many concurrent
     # connections through ONE ring. Each conn ping-pongs in parallel;
-    # one wait() reaps a burst of completions per syscall.
-    var ring = Ring(max(256, conns * 4))
+    # one wait() reaps a burst of completions per syscall. SQPOLL on
+    # top drops the per-submit syscall — the kthread polls our tail.
+    var ring = Ring(
+        max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000
+    )
     ring.setup_buffers(entries=max(64, conns * 2), buf_size=32768, bgid=1)
     var afds = List[Int32]()
     var cfds = List[Int32]()
@@ -195,6 +218,139 @@ def _bench_ring_fanout(
     return Float64(target) / (Float64(t1 - t0) / 1e9)
 
 
+def _bench_ring_fanout_direct(
+    msg_size: Int, rounds: Int, conns: Int, *, sqpoll: Bool = False
+) raises -> Float64:
+    """Same shape as _bench_ring_fanout but every fd lives in the
+    registered table: socket_direct for clients, accept_direct for
+    servers, recv/send/close with fixed=True. The kernel skips the
+    per-op fget refcount bump on the hot path."""
+    var ring = Ring(
+        max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000
+    )
+    ring.register_files(conns * 2 + 16)
+    ring.setup_buffers(entries=max(64, conns * 2), buf_size=32768, bgid=1)
+
+    # Set up one listener (raw), then spawn `conns` client/server
+    # pairs entirely through direct fds.
+    var lfd = _pair_listener(UInt16(0))
+    var port = _pair_local_port(lfd)
+    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+
+    var afds = List[Int32]()  # server-side direct slots
+    var cfds = List[Int32]()  # client-side direct slots
+    var accept_ops = List[UInt64]()
+    var connect_ops = List[UInt64]()
+    var sock_ops = List[UInt64]()
+
+    # First open all client direct sockets via OP_SOCKET (synchronous
+    # in the kernel; they all complete after one wait).
+    for _ in range(conns):
+        sock_ops.append(ring.socket_direct(Int(AF_INET), Int(SOCK_STREAM), 0).raw)
+    _ = ring.wait(min_complete=conns)
+    var client_slots = List[Int32]()
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        var done = c.take()
+        done.ok()
+        client_slots.append(done.res)
+
+    # Then issue accept_direct(s) and connect_fixed(s) interleaved.
+    for i in range(conns):
+        accept_ops.append(ring.accept_direct(lfd).raw)
+        connect_ops.append(
+            ring.connect(client_slots[i], dest, fixed=True).raw
+        )
+    _ = ring.wait(min_complete=conns * 2)
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        var done = c.take()
+        done.ok()
+        if done.kind == KIND_ACCEPT_DIRECT:
+            afds.append(done.res)
+    cfds = client_slots.copy()
+
+    # Arm multishot recv on every direct fd.
+    for i in range(conns):
+        _ = ring.recv_multishot(afds[i], fixed=True)
+        _ = ring.recv_multishot(cfds[i], fixed=True)
+
+    var is_server_fd = Dict[Int32, Bool]()
+    for i in range(conns):
+        is_server_fd[afds[i]] = True
+        is_server_fd[cfds[i]] = False
+    var msg = List[UInt8](length=msg_size, fill=0x42)
+    for ci in range(conns):
+        _ = ring.send_copy(cfds[ci], Span(msg), fixed=True)
+    var pings = 0
+    var target = rounds * conns
+    var t0 = perf_counter_ns()
+    while pings < target:
+        _ = ring.wait(min_complete=1)
+        while True:
+            var c = ring.next_completion()
+            if not c:
+                break
+            var done = c.take()
+            if done.kind == KIND_RECV_MULTI:
+                if done.res <= 0:
+                    continue
+                var view = ring.buffer_view(done.bid, Int(done.res))
+                if is_server_fd[done.fd]:
+                    _ = ring.send_copy(done.fd, view, fixed=True)
+                else:
+                    pings += 1
+                    if pings < target:
+                        _ = ring.send_copy(done.fd, view, fixed=True)
+                ring.recycle_buffer(done.bid)
+    var t1 = perf_counter_ns()
+    for i in range(conns):
+        _ = ring.close_fd(afds[i], fixed=True)
+        _ = ring.close_fd(cfds[i], fixed=True)
+    _ = ring.wait(min_complete=conns * 2)
+    while True:
+        var c = ring.next_completion()
+        if not c:
+            break
+        _ = c.take()
+    _ = sys_close(lfd)
+    return Float64(target) / (Float64(t1 - t0) / 1e9)
+
+
+def _pair_listener(port: UInt16) raises -> Int32:
+    """Just the listening side of a _pair, returned as a raw fd."""
+    var rc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
+    if rc < 0:
+        raise Error("bench: socket " + errno_message(Int32(-rc)))
+    var lfd = Int32(rc)
+    var one = Int32(1)
+    _ = sys_setsockopt(
+        lfd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        UnsafePointer(to=one).bitcast[UInt8](),
+        4,
+    )
+    var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
+    var ip = IpAddress.v4(127, 0, 0, 1)
+    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    _ = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
+    _ = sys_listen(lfd, 256)
+    return lfd
+
+
+def _pair_local_port(lfd: Int32) raises -> UInt16:
+    """Read the kernel-chosen local port of a listening socket."""
+    var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
+    var alen = UInt32(SOCKADDR_STORAGE_SIZE)
+    _ = sys_getsockname(lfd, sa.unsafe_ptr(), UnsafePointer(to=alen))
+    return (UInt16(sa[2]) << 8) | UInt16(sa[3])
+
+
 def _bench_poller(msg_size: Int, rounds: Int) raises -> Float64:
     var p = _pair(UInt16(19823))
     var afd = p[0]
@@ -206,7 +362,7 @@ def _bench_poller(msg_size: Int, rounds: Int) raises -> Float64:
     var buf = List[UInt8](length=msg_size, fill=0)
     var t0 = perf_counter_ns()
     for _ in range(rounds):
-        _ = libc_send(cfd, msg.unsafe_ptr(), msg_size, Int32(0x4000))
+        _ = sys_send(cfd, msg.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         # server side: epoll-driven read of the full message, then echo
         var got = 0
         while got < msg_size:
@@ -214,26 +370,26 @@ def _bench_poller(msg_size: Int, rounds: Int) raises -> Float64:
             for e_idx in range(len(events)):
                 if events[e_idx].is_readable():
                     while got < msg_size:
-                        var n = libc_recv(
+                        var n = sys_recv(
                             afd,
                             buf.unsafe_ptr() + got,
                             msg_size - got,
-                            Int32(0x40),  # MSG_DONTWAIT
+                            MSG_DONTWAIT,
                         )
                         if n <= 0:
                             break
                         got += Int(n)
-        _ = libc_send(afd, buf.unsafe_ptr(), msg_size, Int32(0x4000))
+        _ = sys_send(afd, buf.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         var back = 0
         while back < msg_size:
-            var n = libc_recv(
-                cfd, buf.unsafe_ptr() + back, msg_size - back, Int32(0)
+            var n = sys_recv(
+                cfd, buf.unsafe_ptr() + back, msg_size - back, 0
             )
             back += Int(n)
     var t1 = perf_counter_ns()
     poller.unregister(afd)
-    _ = libc_close(afd)
-    _ = libc_close(cfd)
+    _ = sys_close(afd)
+    _ = sys_close(cfd)
     return Float64(rounds) / (Float64(t1 - t0) / 1e9)
 
 
@@ -267,4 +423,20 @@ def main() raises:
         var conns = conn_counts[ci]
         var per = 1500
         var rate = _bench_ring_fanout(64, per, conns)
-        print(String(conns) + " conns x 64B:", " ring", Int(rate), "rt/s")
+        var rate_sq = _bench_ring_fanout(64, per, conns, sqpoll=True)
+        var rate_dx = _bench_ring_fanout_direct(64, per, conns)
+        var rate_dx_sq = _bench_ring_fanout_direct(
+            64, per, conns, sqpoll=True
+        )
+        print(
+            String(conns) + " conns x 64B: ",
+            " ring",
+            Int(rate),
+            " +sqpoll",
+            Int(rate_sq),
+            " +direct",
+            Int(rate_dx),
+            " +direct+sqpoll",
+            Int(rate_dx_sq),
+            "rt/s",
+        )

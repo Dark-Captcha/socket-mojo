@@ -8,34 +8,33 @@
 # This lets one Mojo thread service thousands of concurrent
 # connections (the tier-2 concurrency story in socket-mojo's plan).
 
-from socket._libc import (
-    F_GETFL,
-    F_SETFL,
+from socket._syscalls import (
     O_NONBLOCK,
-    errno,
     errno_message,
-    fcntl_get_flags,
-    fcntl_set_flags,
+    sys_fcntl_getfl,
+    sys_fcntl_setfl,
 )
 
 
 def set_nonblocking(fd: Int32, enabled: Bool = True) raises:
     """Toggle O_NONBLOCK on the file descriptor. After this, read/
     write/recv_from raise EAGAIN when no progress is possible."""
-    var flags = fcntl_get_flags(fd)
-    if flags == -1:
+    var flags = sys_fcntl_getfl(fd)
+    if flags < 0:
         raise Error(
-            "socket.nonblocking: fcntl(F_GETFL) " + errno_message(errno())
+            "socket.nonblocking: fcntl(F_GETFL) "
+            + errno_message(Int32(-flags))
         )
-    var new_flags = (flags | Int32(O_NONBLOCK)) if enabled else (
-        flags & ~Int32(O_NONBLOCK)
+    var new_flags = (flags | O_NONBLOCK) if enabled else (
+        flags & ~O_NONBLOCK
     )
     if new_flags == flags:
         return
-    var rv = fcntl_set_flags(fd, new_flags)
+    var rv = sys_fcntl_setfl(fd, new_flags)
     if rv != 0:
         raise Error(
-            "socket.nonblocking: fcntl(F_SETFL) " + errno_message(errno())
+            "socket.nonblocking: fcntl(F_SETFL) "
+            + errno_message(Int32(-rv))
         )
 
 

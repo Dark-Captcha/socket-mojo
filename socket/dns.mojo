@@ -1,208 +1,263 @@
-# DNS resolution via libc `getaddrinfo`. Synchronous and blocking, like
-# every other v0 entry point. The function follows the system resolver
-# (`/etc/resolv.conf` on Linux), so it inherits whatever DNS-over-TLS /
-# resolved / mDNS configuration is in place.
+# Native DNS resolver. No getaddrinfo, no glibc nss, no system
+# resolver consultation through libc. Reads /etc/hosts and /etc/
+# resolv.conf directly via openat(2)/read(2), and drives the
+# RFC 1035 codec (dnswire.mojo) over io_uring for the network half.
 #
-# For literal IP strings (`127.0.0.1`, `::1`) we short-circuit and skip
-# the resolver entirely.
-#
-# Pointer handling note: this Mojo nightly's `UnsafePointer` is non-
-# nullable, so we never construct one from `nullptr`. Foreign pointers
-# the C ABI hands back through out-params land in an 8-byte InlineArray
-# slot; we read them as a `UInt64` and only convert to an
-# UnsafePointer-shaped UInt when handing them straight back to libc
-# (`freeaddrinfo`). The byte-by-byte poke into `struct addrinfo` works
-# because we only ever read it.
+# Lookup order in `resolve(host)`:
+#   1. literal IP   → return immediately
+#   2. /etc/hosts   → return matching aliases (system override)
+#   3. /etc/resolv.conf nameservers → UDP query with retry + TCP
+#      fallback on TC. Queries A then AAAA against the first
+#      nameserver that responds; rcode != 0 (NXDOMAIN, etc.) is
+#      terminal — we don't retry other nameservers in that case.
 
-from std.ffi import external_call
-
-from socket._libc import AF_INET, AF_INET6, SOCK_STREAM
-from socket.addr import IpAddress, parse_ip
-
-
-# struct addrinfo on Linux glibc (48 bytes; offsets matter):
-#   [0..4]   ai_flags     int
-#   [4..8]   ai_family    int
-#   [8..12]  ai_socktype  int
-#   [12..16] ai_protocol  int
-#   [16..20] ai_addrlen   socklen_t (uint32)
-#   [20..24] padding
-#   [24..32] ai_addr      sockaddr*
-#   [32..40] ai_canonname char*
-#   [40..48] ai_next      addrinfo*
-
-
-@always_inline
-def _load_u64_le(buf: InlineArray[UInt8, 8]) -> UInt64:
-    var w = UInt64(0)
-    for i in range(8):
-        w |= UInt64(buf[i]) << UInt64(8 * i)
-    return w
-
-
-@always_inline
-def _read_u8_at_addr(addr: UInt64, offset: Int) -> UInt8:
-    """Treat `addr` as a raw foreign pointer and read one byte at
-    `addr + offset`. Used to walk the libc-allocated addrinfo linked
-    list without ever constructing an UnsafePointer through `nullptr`.
-    """
-    # We bridge through libc memcpy: copy 1 byte from (addr+offset) into
-    # a local stack slot. This avoids any UnsafePointer construction
-    # for the unknown remote address.
-    var slot = InlineArray[UInt8, 1](fill=0)
-    _ = external_call["memcpy", UInt](
-        slot.unsafe_ptr(),
-        UInt(Int(addr) + offset),
-        UInt(1),
-    )
-    return slot[0]
-
-
-@always_inline
-def _read_u32_at_addr(addr: UInt64, offset: Int) -> UInt32:
-    var slot = InlineArray[UInt8, 4](fill=0)
-    _ = external_call["memcpy", UInt](
-        slot.unsafe_ptr(),
-        UInt(Int(addr) + offset),
-        UInt(4),
-    )
-    return (
-        UInt32(slot[0])
-        | (UInt32(slot[1]) << 8)
-        | (UInt32(slot[2]) << 16)
-        | (UInt32(slot[3]) << 24)
-    )
-
-
-@always_inline
-def _read_u64_at_addr(addr: UInt64, offset: Int) -> UInt64:
-    var slot = InlineArray[UInt8, 8](fill=0)
-    _ = external_call["memcpy", UInt](
-        slot.unsafe_ptr(),
-        UInt(Int(addr) + offset),
-        UInt(8),
-    )
-    return _load_u64_le(slot)
-
-
-def resolve(host: String) raises -> List[IpAddress]:
-    """Resolve `host` to a list of IP addresses. Literal IPs short-
-    circuit. Raises with prefix `socket.dns:` on failure."""
-    # Literal-IP fast path.
-    try:
-        var literal = parse_ip(host)
-        var out = List[IpAddress]()
-        out.append(literal)
-        return out^
-    except:
-        pass
-
-    # NUL-terminated host name for libc.
-    var host_c = List[UInt8](capacity=host.byte_length() + 1)
-    host_c.extend(host.as_bytes())
-    host_c.append(0)
-
-    var hints = InlineArray[UInt8, 48](fill=0)
-    # ai_family = AF_UNSPEC (0), ai_socktype = SOCK_STREAM (1)
-    hints[8] = UInt8(SOCK_STREAM)
-
-    # `res` is an `out` pointer-to-pointer; stash the 8-byte foreign
-    # pointer libc writes here in an InlineArray.
-    var res_slot = InlineArray[UInt8, 8](fill=0)
-    var rv = external_call["getaddrinfo", Int32](
-        host_c.unsafe_ptr(),
-        UInt(0),  # service = NULL
-        hints.unsafe_ptr(),
-        res_slot.unsafe_ptr(),
-    )
-    if rv != 0:
-        raise Error(
-            "socket.dns: getaddrinfo('"
-            + host
-            + "') failed with code "
-            + String(Int(rv))
-        )
-    var head = _load_u64_le(res_slot)
-    var out = List[IpAddress]()
-    var node = head
-    while node != 0:
-        var family = _read_u32_at_addr(node, 4)
-        var addr_ptr = _read_u64_at_addr(node, 24)  # ai_addr
-        if family == UInt32(AF_INET):
-            # sockaddr_in: family(2) | port(2) | inaddr(4) | pad(8)
-            var b0 = _read_u8_at_addr(addr_ptr, 4)
-            var b1 = _read_u8_at_addr(addr_ptr, 5)
-            var b2 = _read_u8_at_addr(addr_ptr, 6)
-            var b3 = _read_u8_at_addr(addr_ptr, 7)
-            out.append(IpAddress.v4(b0, b1, b2, b3))
-        elif family == UInt32(AF_INET6):
-            # sockaddr_in6: family(2) | port(2) | flowinfo(4) | addr(16) | scope(4)
-            var bytes16 = InlineArray[UInt8, 16](fill=0)
-            for i in range(16):
-                bytes16[i] = _read_u8_at_addr(addr_ptr, 8 + i)
-            out.append(IpAddress(True, bytes16))
-        # else: skip unknown families (AF_PACKET, etc.)
-        node = _read_u64_at_addr(node, 40)  # ai_next
-    _ = external_call["freeaddrinfo", NoneType](UInt(Int(head)))
-    return out^
-
-
-# --- Ring-driven resolver (RFC 1035 over the io_uring engine) -----------
-#
-# The sans-io codec lives in socket/dnswire.mojo; this drives it: UDP
-# with a deadline and one retry (fresh transaction id each attempt),
-# then TCP fallback when the server truncates. Uses a private Ring so
-# its completions never interleave with a caller's.
-
-from socket._libc import (
+from socket._syscalls import (
+    AF_INET,
+    AF_INET6,
+    AT_FDCWD,
+    O_CLOEXEC,
+    O_RDONLY,
+    SOCK_CLOEXEC,
     SOCK_DGRAM,
-    close as _libc_close,
-    connect as _libc_connect,
-    errno as _errno,
-    errno_message as _errno_message,
-    socket as _libc_socket,
-    write_sockaddr as _write_sockaddr,
-    SOCKADDR_STORAGE_SIZE as _SS_SIZE,
+    SOCK_STREAM,
+    SOCKADDR_STORAGE_SIZE,
+    errno_message,
+    sys_close,
+    sys_connect,
+    sys_getrandom,
+    sys_openat,
+    sys_read,
+    sys_socket,
+    write_sockaddr,
 )
-from socket.addr import SocketAddr
+from socket.addr import IpAddress, SocketAddr, parse_ip
 from socket.dnswire import (
+    DnsAnswer,
     QTYPE_A,
+    QTYPE_AAAA,
     dns_build_query,
     dns_parse_response,
 )
 from socket.ring import KIND_RECV, KIND_SEND, Completion, Ring
 
 
+# --- file reading helpers --------------------------------------------
+
+def _read_file_bytes(path: String) raises -> List[UInt8]:
+    """Read a whole small text file. Used for /etc/hosts and
+    /etc/resolv.conf — neither is large enough to merit streaming."""
+    var path_c = List[UInt8](capacity=path.byte_length() + 1)
+    path_c.extend(path.as_bytes())
+    path_c.append(0)
+    var rc = sys_openat(
+        AT_FDCWD, path_c.unsafe_ptr(), O_RDONLY | O_CLOEXEC
+    )
+    if rc < 0:
+        raise Error(
+            "socket.dns: open " + path + " " + errno_message(Int32(-rc))
+        )
+    var fd = Int32(rc)
+    var out = List[UInt8]()
+    var buf = List[UInt8](capacity=4096)
+    buf.resize(unsafe_uninit_length=4096)
+    while True:
+        var n = sys_read(fd, buf.unsafe_ptr(), 4096)
+        if n < 0:
+            _ = sys_close(fd)
+            raise Error(
+                "socket.dns: read " + path + " " + errno_message(Int32(-n))
+            )
+        if n == 0:
+            break
+        out.extend(Span(buf)[0:n])
+    _ = sys_close(fd)
+    return out^
+
+
+# --- tiny line/token parser ------------------------------------------
+
+@always_inline
+def _lower(b: UInt8) -> UInt8:
+    if b >= UInt8(ord("A")) and b <= UInt8(ord("Z")):
+        return b + 32
+    return b
+
+
+def _ci_equals(a: Span[UInt8, _], b: Span[UInt8, _]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if _lower(a[i]) != _lower(b[i]):
+            return False
+    return True
+
+
+def _slice_to_str(text: Span[UInt8, _], start: Int, end: Int) -> String:
+    var buf = List[UInt8](capacity=end - start)
+    for i in range(start, end):
+        buf.append(text[i])
+    return String(unsafe_from_utf8=buf)
+
+
+def _tokenize_line(line: Span[UInt8, _]) -> List[Int]:
+    """Whitespace-separated tokens. Returns a flat list of
+    [start0, end0, start1, end1, ...]. Stops at the first '#' comment
+    marker; empty/comment-only lines yield an empty list."""
+    var out = List[Int]()
+    var end = len(line)
+    for i in range(len(line)):
+        if line[i] == UInt8(ord("#")):
+            end = i
+            break
+    var i = 0
+    while i < end:
+        while i < end and (
+            line[i] == UInt8(ord(" ")) or line[i] == UInt8(ord("\t"))
+        ):
+            i += 1
+        if i >= end:
+            break
+        var start = i
+        while i < end and not (
+            line[i] == UInt8(ord(" ")) or line[i] == UInt8(ord("\t"))
+        ):
+            i += 1
+        out.append(start)
+        out.append(i)
+    return out^
+
+
+# --- /etc/hosts ------------------------------------------------------
+
+def _lookup_hosts(host: String) -> List[IpAddress]:
+    """Walk /etc/hosts looking for `host`. Returns matching IPs in
+    file order; empty if the file is missing or no match. ASCII
+    case-insensitive."""
+    var out = List[IpAddress]()
+    var text: List[UInt8]
+    try:
+        text = _read_file_bytes(String("/etc/hosts"))
+    except:
+        return out^
+    var host_bytes = host.as_bytes()
+    var span = Span(text)
+    var n = len(span)
+    var line_start = 0
+    for i in range(n):
+        if span[i] != UInt8(ord("\n")):
+            continue
+        _hosts_match_line(span, line_start, i, host_bytes, out)
+        line_start = i + 1
+    if line_start < n:
+        _hosts_match_line(span, line_start, n, host_bytes, out)
+    return out^
+
+
+def _hosts_match_line(
+    span: Span[UInt8, _],
+    line_start: Int,
+    line_end: Int,
+    host_bytes: Span[UInt8, _],
+    mut out: List[IpAddress],
+):
+    var line = span[line_start:line_end]
+    var toks = _tokenize_line(line)
+    if len(toks) < 4:  # need at least IP + one name
+        return
+    var ip_str = _slice_to_str(line, toks[0], toks[1])
+    var ip: IpAddress
+    try:
+        ip = parse_ip(ip_str)
+    except:
+        return
+    var ti = 2
+    while ti < len(toks):
+        var name = line[toks[ti] : toks[ti + 1]]
+        if _ci_equals(name, host_bytes):
+            out.append(ip)
+            return
+        ti += 2
+
+
+# --- /etc/resolv.conf ------------------------------------------------
+
+def _read_nameservers() -> List[SocketAddr]:
+    """Parse `nameserver <ip>` directives. Returns the configured
+    nameservers (port 53). Empty list if the file is missing."""
+    var out = List[SocketAddr]()
+    var text: List[UInt8]
+    try:
+        text = _read_file_bytes(String("/etc/resolv.conf"))
+    except:
+        return out^
+    var span = Span(text)
+    var n = len(span)
+    var line_start = 0
+    for i in range(n):
+        if span[i] != UInt8(ord("\n")):
+            continue
+        _resolv_collect_line(span, line_start, i, out)
+        line_start = i + 1
+    if line_start < n:
+        _resolv_collect_line(span, line_start, n, out)
+    return out^
+
+
+def _resolv_collect_line(
+    span: Span[UInt8, _],
+    line_start: Int,
+    line_end: Int,
+    mut out: List[SocketAddr],
+):
+    var line = span[line_start:line_end]
+    var toks = _tokenize_line(line)
+    if len(toks) < 4:
+        return
+    var first = line[toks[0] : toks[1]]
+    var keyword_str = String("nameserver")
+    if not _ci_equals(first, keyword_str.as_bytes()):
+        return
+    var ip_str = _slice_to_str(line, toks[2], toks[3])
+    try:
+        var ip = parse_ip(ip_str)
+        out.append(SocketAddr(ip, 53))
+    except:
+        pass
+
+
+# --- DNS over io_uring -----------------------------------------------
+
 def _random_txid() raises -> UInt16:
     # transaction ids must be unpredictable (spoofing resistance)
     var b = InlineArray[UInt8, 2](fill=0)
-    var n = external_call["getrandom", Int](b.unsafe_ptr(), 2, UInt32(0))
+    var n = sys_getrandom(b.unsafe_ptr(), 2, 0)
     if n != 2:
         raise Error("socket.dns: getrandom failed")
     return (UInt16(b[0]) << 8) | UInt16(b[1])
 
 
-def _connected_socket(server: SocketAddr, socktype: Int32) raises -> Int32:
-    var family = Int32(AF_INET6 if server.ip.is_v6 else AF_INET)
-    var fd = _libc_socket(family, socktype, Int32(0))
-    if fd < 0:
-        raise Error("socket.dns: socket() " + _errno_message(_errno()))
-    var sa = InlineArray[UInt8, _SS_SIZE](fill=0)
-    var alen = _write_sockaddr(
+def _connected_socket(server: SocketAddr, socktype: Int) raises -> Int32:
+    """Open a fresh fd connected to `server`. The fd is OWNED by the
+    caller (the Ring only owns its io_uring fd)."""
+    var family = AF_INET6 if server.ip.is_v6 else AF_INET
+    var rc = sys_socket(family, socktype | SOCK_CLOEXEC, 0)
+    if rc < 0:
+        raise Error("socket.dns: socket() " + errno_message(Int32(-rc)))
+    var fd = Int32(rc)
+    var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
+    var alen = write_sockaddr(
         sa.unsafe_ptr(), server.ip.is_v6, server.ip.octets, server.port
     )
-    # UDP connect is local bookkeeping; TCP connect through the ring
-    # would also work, but a blocking loopback/LAN connect keeps the
-    # resolver's completion handling single-purpose.
-    if _libc_connect(fd, sa.unsafe_ptr(), alen) != 0:
-        var msg = _errno_message(_errno())
-        _ = _libc_close(fd)
+    var crc = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
+    if crc != 0:
+        var msg = errno_message(Int32(-crc))
+        _ = sys_close(fd)
         raise Error("socket.dns: connect() " + msg)
     return fd
 
 
 def _await_recv(mut ring: Ring) raises -> Completion:
-    """Drives the private ring until the recv completes; send acks and
+    """Drives a private ring until the recv completes; send acks and
     timeout partners are validated and dropped."""
     while True:
         _ = ring.wait(min_complete=1)
@@ -219,7 +274,6 @@ def _await_recv(mut ring: Ring) raises -> Completion:
 
 
 def _drain(mut ring: Ring) raises:
-    """Reap and discard any remaining completions on a private ring."""
     while True:
         var c = ring.next_completion()
         if not c:
@@ -231,9 +285,7 @@ def _query_udp(
     server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
 ) raises -> List[UInt8]:
     var ring = Ring(16)
-    # _connected_socket returns a raw fd nothing owns; reclaim it on every
-    # exit (the ring only owns its own io_uring fd).
-    var fd = _connected_socket(server, Int32(SOCK_DGRAM))
+    var fd = _connected_socket(server, SOCK_DGRAM)
     try:
         _ = ring.send_copy(fd, query)
         _ = ring.recv_with_timeout(fd, 2048, Int64(timeout_ms) * 1_000_000)
@@ -247,7 +299,7 @@ def _query_udp(
         _drain(ring)
         return payload^
     except e:
-        _ = _libc_close(fd)
+        _ = sys_close(fd)
         raise e^
 
 
@@ -255,8 +307,7 @@ def _query_tcp(
     server: SocketAddr, query: Span[UInt8, _], timeout_ms: Int
 ) raises -> List[UInt8]:
     var ring = Ring(16)
-    # _connected_socket returns a raw fd nothing owns; reclaim it on every exit.
-    var fd = _connected_socket(server, Int32(SOCK_STREAM))
+    var fd = _connected_socket(server, SOCK_STREAM)
     try:
         # RFC 1035 4.2.2: two-byte big-endian length prefix
         var framed = List[UInt8](capacity=len(query) + 2)
@@ -286,33 +337,22 @@ def _query_tcp(
         body.extend(Span(acc)[2 : 2 + want])
         return body^
     except e:
-        _ = _libc_close(fd)
+        _ = sys_close(fd)
         raise e^
 
 
-def resolve_dns(
+def _resolve_answer(
     host: String,
     *,
     server: SocketAddr,
-    qtype: UInt16 = QTYPE_A,
+    qtype: UInt16,
     timeout_ms: Int = 2000,
     retries: Int = 2,
-) raises -> List[IpAddress]:
-    """Resolves `host` against an explicit DNS server through the
-    io_uring engine.
-
-    UDP with per-attempt deadline and fresh transaction ids, TCP
-    fallback on truncation. NXDOMAIN and other server errors raise; an
-    empty answer returns an empty list. (resolve(), above, remains the
-    system-configured getaddrinfo path.)
-    """
-    try:
-        var literal = parse_ip(host)
-        var out = List[IpAddress]()
-        out.append(literal)
-        return out^
-    except:
-        pass
+) raises -> DnsAnswer:
+    """Internal: query a single nameserver and return the parsed
+    DnsAnswer (carrying rcode + addresses). Raises only on transport
+    failure or malformed responses; rcode != 0 (NXDOMAIN, SERVFAIL,
+    ...) is reflected in the returned answer."""
     for attempt in range(retries):
         var txid = _random_txid()
         var query = dns_build_query(txid, host, qtype)
@@ -320,7 +360,6 @@ def resolve_dns(
         try:
             raw = _query_udp(server, Span(query), timeout_ms)
         except:
-            # timeout or transport failure: retry with a fresh txid
             if attempt + 1 == retries:
                 raise Error(
                     "socket.dns: no response from server for '"
@@ -334,14 +373,100 @@ def resolve_dns(
         if ans.truncated:
             var raw2 = _query_tcp(server, Span(query), timeout_ms)
             ans = dns_parse_response(Span(raw2), txid, qtype, host)
-        if ans.rcode != 0:
-            # server-reported errors are final, no retry
-            raise Error(
-                "socket.dns: server error rcode="
-                + String(Int(ans.rcode))
-                + " for '"
-                + host
-                + "'"
-            )
-        return ans.addresses.copy()
+        return ans^
     raise Error("socket.dns: unreachable")
+
+
+def resolve_dns(
+    host: String,
+    *,
+    server: SocketAddr,
+    qtype: UInt16 = QTYPE_A,
+    timeout_ms: Int = 2000,
+    retries: Int = 2,
+) raises -> List[IpAddress]:
+    """Query `server` directly for `host` of `qtype` (A or AAAA).
+    UDP with per-attempt deadline and fresh transaction ids; TCP
+    fallback on truncation. NXDOMAIN and other server errors raise."""
+    try:
+        var literal = parse_ip(host)
+        var out = List[IpAddress]()
+        out.append(literal)
+        return out^
+    except:
+        pass
+    var ans = _resolve_answer(
+        host,
+        server=server,
+        qtype=qtype,
+        timeout_ms=timeout_ms,
+        retries=retries,
+    )
+    if ans.rcode != 0:
+        raise Error(
+            "socket.dns: server error rcode="
+            + String(Int(ans.rcode))
+            + " for '"
+            + host
+            + "'"
+        )
+    return ans.addresses.copy()
+
+
+# --- public entry point ----------------------------------------------
+
+def resolve(host: String) raises -> List[IpAddress]:
+    """Resolve `host` to a list of IP addresses (A records first,
+    then AAAA). The full lookup chain: literal-IP fast path →
+    /etc/hosts override → DNS query against each `nameserver` in
+    /etc/resolv.conf. No glibc resolver, no getaddrinfo, no nss."""
+    try:
+        var literal = parse_ip(host)
+        var out = List[IpAddress]()
+        out.append(literal)
+        return out^
+    except:
+        pass
+    var hosts_match = _lookup_hosts(host)
+    if len(hosts_match) > 0:
+        return hosts_match^
+    var nameservers = _read_nameservers()
+    if len(nameservers) == 0:
+        # No /etc/resolv.conf and no /etc/hosts hit — assume a local
+        # resolver on loopback (systemd-resolved binds 127.0.0.53,
+        # but the conventional fallback is 127.0.0.1:53).
+        nameservers.append(SocketAddr(IpAddress.v4(127, 0, 0, 1), 53))
+    var got_answer = False
+    var rcode: UInt8 = 0
+    var addrs = List[IpAddress]()
+    for ni in range(len(nameservers)):
+        var ns = nameservers[ni]
+        var ans_a: DnsAnswer
+        try:
+            ans_a = _resolve_answer(host, server=ns, qtype=QTYPE_A)
+        except:
+            continue  # transport failure: try next ns
+        got_answer = True
+        rcode = ans_a.rcode
+        if rcode != 0:
+            break  # the server has a definitive opinion — no retry
+        for i in range(len(ans_a.addresses)):
+            addrs.append(ans_a.addresses[i])
+        # AAAA is optional; absence is normal.
+        try:
+            var ans_aaaa = _resolve_answer(host, server=ns, qtype=QTYPE_AAAA)
+            if ans_aaaa.rcode == 0:
+                for i in range(len(ans_aaaa.addresses)):
+                    addrs.append(ans_aaaa.addresses[i])
+        except:
+            pass
+        return addrs^
+    if got_answer:
+        raise Error(
+            "socket.dns: server error rcode="
+            + String(Int(rcode))
+            + " for '"
+            + host
+            + "'"
+        )
+    raise Error("socket.dns: no nameservers reachable for '" + host + "'")
