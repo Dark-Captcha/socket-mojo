@@ -121,6 +121,35 @@ Each accepted connection becomes a direct fd slot. Use it with
 `recv/send/connect/close_fd(slot, fixed=True)` — the kernel skips
 the fget refcount bump on every op.
 
+### Typed error handling
+
+socket-mojo raises `Error` with a stable string format (`socket.X:
+<op> <ETAG>`). `socket/errors.mojo` gives callers predicates so
+they don't have to grep the message themselves.
+
+```mojo
+from socket.errors import (
+    is_connection_refused,
+    is_timed_out,
+    is_dns_error,
+    errno_of,
+    ECONNREFUSED,
+)
+from socket.tcp import TcpSocket
+
+def connect_with_fallback(hosts: List[String]) raises -> TcpSocket:
+    for h in hosts:
+        try:
+            return TcpSocket.connect(h, 443, timeout_seconds=5.0)
+        except e:
+            if is_dns_error(e):
+                continue                       # try next host
+            if is_connection_refused(e) or is_timed_out(e):
+                continue                       # host unreachable
+            raise e^                           # something unexpected
+    raise Error("no host reachable")
+```
+
 ### DNS
 
 ```mojo

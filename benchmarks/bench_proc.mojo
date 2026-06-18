@@ -4,8 +4,11 @@
 # layer instead of taking the same-process shortcut.
 #
 # Usage:
-#   pixi run mojo run -I . benchmarks/bench_proc.mojo server <port> <conns>
-#   pixi run mojo run -I . benchmarks/bench_proc.mojo client <port> <conns> <rounds>
+#   pixi run mojo run -I . benchmarks/bench_proc.mojo server <port> <conns> [sqpoll]
+#   pixi run mojo run -I . benchmarks/bench_proc.mojo client <port> <conns> <rounds> [payload] [sqpoll]
+#
+# Pass "sqpoll" as the last positional arg to engage the kernel SQ
+# poller on both ends. Payload defaults to 64 bytes.
 #
 # The shell driver below spawns both:
 #   ./benchmarks/run_bench_proc.sh
@@ -60,12 +63,17 @@ def _bind_listener(port: UInt16) raises -> Int32:
     return lfd
 
 
-def _run_server(port: UInt16, conns: Int) raises:
+def _run_server(port: UInt16, conns: Int, sqpoll: Bool) raises:
     """Echo server. Accepts `conns` connections via multishot accept,
     arms multishot recv on each, echoes everything back. Exits when
     every connection has closed cleanly. Reports nothing — the client
     is the timing authority."""
-    var ring = Ring(max(256, conns * 4), defer_taskrun=True)
+    var ring = Ring(
+        max(256, conns * 4),
+        sqpoll=sqpoll,
+        sqpoll_idle_ms=2000,
+        defer_taskrun=not sqpoll,  # defer_taskrun doesn't compose with sqpoll
+    )
     ring.setup_buffers(entries=max(128, conns * 2), buf_size=16384, bgid=0)
     var lfd = _bind_listener(port)
     _ = ring.accept_multishot(lfd)
@@ -97,13 +105,24 @@ def _run_server(port: UInt16, conns: Int) raises:
     _ = sys_close(lfd)
 
 
-def _run_client(port: UInt16, conns: Int, rounds: Int) raises:
+def _run_client(
+    port: UInt16, conns: Int, rounds: Int, payload_size: Int, sqpoll: Bool
+) raises:
     """Open `conns` sockets, ping-pong each `rounds` times, print
     rt/s. Mirrors the existing in-process fan-out benchmark but the
     other end is a separate process talking through real loopback
     TCP."""
-    var ring = Ring(max(256, conns * 4), defer_taskrun=True)
-    ring.setup_buffers(entries=max(128, conns * 2), buf_size=16384, bgid=0)
+    var ring = Ring(
+        max(256, conns * 4),
+        sqpoll=sqpoll,
+        sqpoll_idle_ms=2000,
+        defer_taskrun=not sqpoll,
+    )
+    ring.setup_buffers(
+        entries=max(128, conns * 2),
+        buf_size=max(16384, payload_size * 2),
+        bgid=0,
+    )
     var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
 
     # Open + connect each socket.
@@ -130,7 +149,7 @@ def _run_client(port: UInt16, conns: Int, rounds: Int) raises:
     # Arm recv on every conn and prime the first ping.
     for i in range(conns):
         _ = ring.recv_multishot(fds[i])
-    var msg = List[UInt8](length=64, fill=0x42)
+    var msg = List[UInt8](length=payload_size, fill=0x42)
     for i in range(conns):
         _ = ring.send_copy(fds[i], Span(msg))
 
@@ -156,12 +175,17 @@ def _run_client(port: UInt16, conns: Int, rounds: Int) raises:
                 ring.recycle_buffer(done.bid)
     var t1 = perf_counter_ns()
     var rate = Float64(target) / (Float64(t1 - t0) / 1e9)
+    var mode = "sqpoll" if sqpoll else "ring  "
     print(
-        "two-proc:",
+        "two-proc",
+        mode,
+        " ",
         conns,
         "conns x",
         rounds,
-        "rounds → ",
+        "rounds @",
+        payload_size,
+        "B →",
         Int(rate),
         "rt/s",
     )
@@ -169,22 +193,46 @@ def _run_client(port: UInt16, conns: Int, rounds: Int) raises:
         _ = sys_close(fds[i])
 
 
+def _arg(args: List[String], i: Int, fallback: String) -> String:
+    return args[i] if i < len(args) else fallback
+
+
+def _has(args: List[String], needle: String) -> Bool:
+    for i in range(len(args)):
+        if args[i] == needle:
+            return True
+    return False
+
+
 def main() raises:
     var args = argv()
-    if len(args) < 3:
+    var args_list = List[String]()
+    for i in range(len(args)):
+        args_list.append(String(args[i]))
+    if len(args_list) < 3:
         print(
-            "usage: bench_proc.mojo {server <port> <conns>"
-            " | client <port> <conns> <rounds>}"
+            "usage: bench_proc.mojo {server <port> <conns> [sqpoll]"
+            " | client <port> <conns> <rounds> [payload] [sqpoll]}"
         )
         return
-    var role = args[1]
-    var port = UInt16(Int(args[2]))
+    var role = args_list[1]
+    var port = UInt16(Int(args_list[2]))
+    var sqpoll = _has(args_list, String("sqpoll"))
     if role == "server":
-        var conns = Int(args[3]) if len(args) > 3 else 64
-        _run_server(port, conns)
+        var conns = Int(_arg(args_list, 3, String("64")))
+        if conns <= 0:
+            conns = 64
+        _run_server(port, conns, sqpoll)
     elif role == "client":
-        var conns = Int(args[3]) if len(args) > 3 else 64
-        var rounds = Int(args[4]) if len(args) > 4 else 1000
-        _run_client(port, conns, rounds)
+        var conns = Int(_arg(args_list, 3, String("64")))
+        if conns <= 0:
+            conns = 64
+        var rounds = Int(_arg(args_list, 4, String("1000")))
+        if rounds <= 0:
+            rounds = 1000
+        var payload = Int(_arg(args_list, 5, String("64")))
+        if payload <= 0:
+            payload = 64
+        _run_client(port, conns, rounds, payload, sqpoll)
     else:
         print("unknown role:", role)

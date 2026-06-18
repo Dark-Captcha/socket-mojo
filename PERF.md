@@ -37,16 +37,45 @@ the `epoll_wait` cost without recouping it on a single fd.
 `./benchmarks/run_bench_proc.sh`: separate Mojo server + Mojo client
 processes, kernel TCP between them. The in-process bench above
 takes the same-process shortcut path; this one exercises the full
-socket layer.
+socket layer (real SYN/ACK, real recvmsg, real wakeups).
 
-|        | client-measured rate |
-|-------:|---------------------:|
-|  64 conns × 2000 rounds | ~267 k rt/s |
+### 64-byte payload
 
-(Client's perspective: one `send + recv` per round. Not directly
-comparable to the in-process row above, which counts both sides
-through one Ring. The two-process shape is the more honest proxy
-for what users will see in production deployments.)
+| conns | ring | +sqpoll |
+|------:|-----:|--------:|
+|   16 | 271 k/s | 209 k/s (-23%) |
+|   64 | 259 k/s | 292 k/s (+13%) |
+|  256 | 272 k/s | 289 k/s ( +6%) |
+
+### 4-KiB payload
+
+| conns | ring | +sqpoll |
+|------:|-----:|--------:|
+|   16 | 232 k/s | 235 k/s ( +1%) |
+|   64 | 218 k/s | 236 k/s ( +8%) |
+|  256 | 229 k/s | 262 k/s (+14%) |
+
+**SQPOLL** wins reliably at ≥ 64 conns; at 16 conns the kthread
+doesn't have enough submit traffic to amortise its own CPU cost
+and actually loses ground. This is the expected shape — SQPOLL is
+a high-load knob, not a low-load one. Production servers with
+tens-of-thousands of concurrent connections always have enough
+submit traffic.
+
+Client's perspective here: one `send + recv` per round (the server
+is a separate process). Not directly comparable to the in-process
+row above, which counts both sides through one Ring. The
+two-process shape is the more honest proxy for what users will see
+in deployments.
+
+### What's still missing
+
+These numbers are still **single machine** — no NIC, no driver
+interrupt path, no packet pacing. Run `bench_proc.sh` against an
+`iperf3 -s` on a separate host (or use namespaces with `veth`
+pairs) to get a real network number. The structure of the
+benchmark is the right shape; the missing piece is the second
+box.
 
 Per-connection rate stays flat across 8 → 256 conns: one ring
 drives 256 simultaneous echo flows with no measurable degradation,
