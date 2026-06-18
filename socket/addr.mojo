@@ -314,9 +314,43 @@ struct SocketAddr(Copyable, ImplicitlyCopyable, Movable):
         return SocketAddr(ip, port)
 
     def to_string(self) -> String:
+        # Build "[ip]:port" / "ip:port" into one buffer, then convert once.
+        # The fragments are short (≤47 bytes for v6 with bracket+port) so the
+        # initial capacity covers every legal value.
+        var ip_str = self.ip.to_string()
+        var ip_bytes = ip_str.as_bytes()
+        var port = Int(self.port)
+        var buf = List[UInt8](capacity=48)
         if self.ip.is_v6:
-            return "[" + self.ip.to_string() + "]:" + String(Int(self.port))
-        return self.ip.to_string() + ":" + String(Int(self.port))
+            buf.append(UInt8(ord("[")))
+            buf.extend(ip_bytes)
+            buf.append(UInt8(ord("]")))
+        else:
+            buf.extend(ip_bytes)
+        buf.append(UInt8(ord(":")))
+        # Port is 0..65535; emit minimal width with the standard /100 + table
+        # chunking, but inlined here so addr.mojo has no internal deps.
+        if port < 10:
+            buf.append(UInt8(ord("0")) + UInt8(port))
+        elif port < 100:
+            buf.append(UInt8(ord("0")) + UInt8(port // 10))
+            buf.append(UInt8(ord("0")) + UInt8(port % 10))
+        elif port < 1000:
+            buf.append(UInt8(ord("0")) + UInt8(port // 100))
+            buf.append(UInt8(ord("0")) + UInt8((port // 10) % 10))
+            buf.append(UInt8(ord("0")) + UInt8(port % 10))
+        elif port < 10000:
+            buf.append(UInt8(ord("0")) + UInt8(port // 1000))
+            buf.append(UInt8(ord("0")) + UInt8((port // 100) % 10))
+            buf.append(UInt8(ord("0")) + UInt8((port // 10) % 10))
+            buf.append(UInt8(ord("0")) + UInt8(port % 10))
+        else:
+            buf.append(UInt8(ord("0")) + UInt8(port // 10000))
+            buf.append(UInt8(ord("0")) + UInt8((port // 1000) % 10))
+            buf.append(UInt8(ord("0")) + UInt8((port // 100) % 10))
+            buf.append(UInt8(ord("0")) + UInt8((port // 10) % 10))
+            buf.append(UInt8(ord("0")) + UInt8(port % 10))
+        return String(unsafe_from_utf8=buf)
 
     def __eq__(self, other: SocketAddr) -> Bool:
         return self.port == other.port and self.ip == other.ip

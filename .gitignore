@@ -9,3 +9,4 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+output/
