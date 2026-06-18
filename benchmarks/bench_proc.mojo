@@ -23,6 +23,7 @@ from socket._syscalls import (
     SOCKADDR_STORAGE_SIZE,
     SOL_SOCKET,
     SO_REUSEADDR,
+    SO_REUSEPORT,
     errno_message,
     sys_bind,
     sys_close,
@@ -41,7 +42,7 @@ from socket.ring import (
 from std.memory import UnsafePointer
 
 
-def _bind_listener(port: UInt16) raises -> Int32:
+def _bind_listener(port: UInt16, reuseport: Bool = False) raises -> Int32:
     var rc = sys_socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
     if rc < 0:
         raise Error("bench: socket " + errno_message(Int32(-rc)))
@@ -51,6 +52,11 @@ def _bind_listener(port: UInt16) raises -> Int32:
         lfd, SOL_SOCKET, SO_REUSEADDR,
         UnsafePointer(to=one).bitcast[UInt8](), 4,
     )
+    if reuseport:
+        _ = sys_setsockopt(
+            lfd, SOL_SOCKET, SO_REUSEPORT,
+            UnsafePointer(to=one).bitcast[UInt8](), 4,
+        )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(
@@ -63,7 +69,9 @@ def _bind_listener(port: UInt16) raises -> Int32:
     return lfd
 
 
-def _run_server(port: UInt16, conns: Int, sqpoll: Bool) raises:
+def _run_server(
+    port: UInt16, conns: Int, sqpoll: Bool, reuseport: Bool = False
+) raises:
     """Echo server. Accepts `conns` connections via multishot accept,
     arms multishot recv on each, echoes everything back. Exits when
     every connection has closed cleanly. Reports nothing — the client
@@ -75,7 +83,7 @@ def _run_server(port: UInt16, conns: Int, sqpoll: Bool) raises:
         defer_taskrun=not sqpoll,  # defer_taskrun doesn't compose with sqpoll
     )
     ring.setup_buffers(entries=max(128, conns * 2), buf_size=16384, bgid=0)
-    var lfd = _bind_listener(port)
+    var lfd = _bind_listener(port, reuseport)
     _ = ring.accept_multishot(lfd)
 
     var accepted = 0
@@ -218,11 +226,12 @@ def main() raises:
     var role = args_list[1]
     var port = UInt16(Int(args_list[2]))
     var sqpoll = _has(args_list, String("sqpoll"))
+    var reuseport = _has(args_list, String("reuseport"))
     if role == "server":
         var conns = Int(_arg(args_list, 3, String("64")))
         if conns <= 0:
             conns = 64
-        _run_server(port, conns, sqpoll)
+        _run_server(port, conns, sqpoll, reuseport=reuseport)
     elif role == "client":
         var conns = Int(_arg(args_list, 3, String("64")))
         if conns <= 0:

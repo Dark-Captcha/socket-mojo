@@ -28,13 +28,14 @@ from std.memory import UnsafePointer, memcpy
 
 from socket._syscalls import (
     SOCKADDR_STORAGE_SIZE,
+    SYS_IO_URING_REGISTER,
     errno_message,
-    write_sockaddr,
     read_sockaddr,
+    syscall,
+    write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.bufring import BufRing
-from socket._syscalls import SYS_IO_URING_REGISTER, syscall
 from socket.uring_sys import (
     ACCEPT_MULTISHOT,
     CQE_BUFFER_SHIFT,

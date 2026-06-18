@@ -130,6 +130,49 @@ how efficiently they enter/exit that path.** SQPOLL pulls the gap
 closed because the kernel polls the SQ on its own and we don't
 syscall at all on the hot loop.
 
+## Multi-process scaling
+
+`benchmarks/run_bench_multi.sh` spawns N independent
+socket-mojo (server, client) pairs on this 24-core box. Each
+worker is one process, one Ring, no contention between workers.
+Aggregate rt/s sums the per-worker measurements. 32 conns per
+worker × 1000 rounds × 64 B.
+
+| Workers | ring (no sqpoll) | ring + sqpoll |
+|--------:|-----------------:|--------------:|
+| 1       |    137 k/s       |   244 k/s     |
+| 2       |    207 k/s       |   400 k/s     |
+| 4       |    600 k/s       |   516 k/s     |
+| 8       |    1.31 M/s      |   514 k/s     |
+| 16      |    **1.54 M/s**  |   582 k/s     |
+
+Two stories here:
+
+- **Plain Ring scales nearly linearly to 16 workers, hitting
+  1.54 M aggregate rt/s** — 3.3× Go's all-cores number and into
+  the range nginx and friends deliver. This is what a real
+  multi-core deployment of socket-mojo looks like.
+- **SQPOLL kthread contention caps at ~16 workers.** With one
+  kthread per Ring (× 16 worker rings + 16 client rings = 32
+  kthreads) + main threads on a 24-core box, the scheduler
+  oversubscribes and aggregate throughput plateaus. **SQPOLL is
+  the right knob for one big single-process server with many
+  thousands of connections; for thread-per-core / process-per-
+  core deployments, plain Ring scales further.**
+
+The reuseport variant (`MODE=reuseport`) is also implemented but
+hangs on this bench's current "accept exactly N conns then exit"
+shape, because the kernel's hashing may give one server many
+more conns than others. For real production use, servers should
+accept multishot until SIGTERM (which they will once we have an
+SO_REUSEPORT-shaped bench harness).
+
+Loopback caveat applies double here: real network throughput
+will look different because (a) each NIC RX queue has its own
+RSS path so multi-process contention is lower, and (b) hardware
+latency between the two ends adds RTT that the kernel-only
+loopback path doesn't have.
+
 Per-connection rate stays flat across 8 → 256 conns: one ring
 drives 256 simultaneous echo flows with no measurable degradation,
 where the same workload on epoll would require explicit edge-

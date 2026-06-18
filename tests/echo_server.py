@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
 """Tiny TCP echo server used by tests/test_tcp.mojo.
 
-Listens on 127.0.0.1:PORT (default 19501), accepts ONE connection,
-echoes back whatever it receives, then exits. Idempotent: the
-SO_REUSEADDR flag lets us re-bind immediately after a previous run.
+Listens on 127.0.0.1:PORT (default 19501) and echoes everything back
+to every connecting client until killed. Threaded so multiple test
+runs (or a slow Mojo build) don't trip a single-connection limit.
+The previous incarnation served exactly one connection and timed out
+after 10s — both behaviours broke if Mojo's compile took longer.
+Idempotent: SO_REUSEADDR lets us re-bind immediately.
 """
 
 import socket
 import sys
+import threading
+
+
+def _handle(conn: socket.socket) -> None:
+    with conn:
+        while True:
+            try:
+                chunk = conn.recv(4096)
+            except Exception:
+                return
+            if not chunk:
+                return
+            try:
+                conn.sendall(chunk)
+            except Exception:
+                return
 
 
 def main() -> int:
@@ -15,21 +34,12 @@ def main() -> int:
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
-    srv.listen(1)
-    srv.settimeout(10)
+    srv.listen(8)
     print(f"echo server listening on 127.0.0.1:{port}", flush=True)
     try:
-        conn, _peer = srv.accept()
-        with conn:
-            data = b""
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                # Echo immediately so we don't deadlock if the client
-                # waits for a reply before closing its write side.
-                conn.sendall(chunk)
+        while True:
+            conn, _peer = srv.accept()
+            threading.Thread(target=_handle, args=(conn,), daemon=True).start()
     finally:
         srv.close()
     return 0
