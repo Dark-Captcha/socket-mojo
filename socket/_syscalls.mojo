@@ -1,32 +1,22 @@
-# Direct Linux x86_64 syscalls. The only libc surface this layer
-# keeps is two shims: glibc's variadic `syscall(3)` (five lines of
-# register-loading plus the `syscall` instruction) and
-# `__errno_location` (one TLS-slot pointer). No glibc socket
-# wrappers, no glibc resolver, no nss.
+# Direct Linux x86_64 syscalls — ZERO libc symbols.
 #
-# The `syscall()` trampoline normalises libc's failure convention
-# (return -1, set errno) into the kernel ABI's convention (return
-# -errno directly), so every wrapper returns `Int` with success in
-# `rc >= 0` and failure in `-4095 <= rc <= -1` — the actual errno.
-# Callers check `rc < 0` and pass `Int32(-rc)` to `errno_message`
-# for a stable error tag.
+# The `syscall()` trampoline emits the raw `syscall` instruction via
+# inline asm. The System V AMD64 syscall ABI:
+#   in:  rax=nr, rdi=arg0, rsi=arg1, rdx=arg2, r10=arg3, r8=arg4, r9=arg5
+#   out: rax = result (positive on success, -errno on failure)
+#   clobbers: rcx, r11, memory
 #
-# When Mojo's inline-asm story stabilises this trampoline collapses
-# to a single `syscall` instruction with no libc symbols at all and
-# nothing else in the library needs to change.
+# Every wrapper returns `Int` with success in `rc >= 0` and failure
+# in `-4095 <= rc <= -1` — the actual errno, as the kernel reports
+# it. Callers check `rc < 0` and pass `Int32(-rc)` to `errno_message`
+# for a stable error tag. There is no TLS errno slot to read; the
+# kernel's return value IS the error.
 
-from std.ffi import external_call
 from std.memory import UnsafePointer
+from std.sys.intrinsics import inlined_assembly
 
 
 # --- syscall trampoline -----------------------------------------------
-
-@always_inline
-def _errno() -> Int32:
-    return external_call[
-        "__errno_location", UnsafePointer[Int32, MutAnyOrigin]
-    ]()[]
-
 
 @always_inline
 def syscall(
@@ -38,13 +28,16 @@ def syscall(
     e: Int = 0,
     f: Int = 0,
 ) -> Int:
-    """Returns the kernel return value: positive on success, -errno on
-    failure (range -4095..-1). Internally bridges libc's syscall(3) +
-    errno convention to the kernel ABI."""
-    var rc = external_call["syscall", Int](n, a, b, c, d, e, f)
-    if rc == -1:
-        return -Int(_errno())
-    return rc
+    """Direct kernel syscall on x86_64 Linux. No libc."""
+    return inlined_assembly[
+        "syscall",
+        Int,
+        constraints=(
+            "={rax},0,{rdi},{rsi},{rdx},{r10},{r8},{r9}"
+            ",~{rcx},~{r11},~{memory}"
+        ),
+        has_side_effect=True,
+    ](n, a, b, c, d, e, f)
 
 
 # --- Linux x86_64 syscall numbers (stable across kernel versions) -----
@@ -102,6 +95,11 @@ comptime SO_RCVBUF = 8
 comptime SO_SNDBUF = 7
 comptime SO_RCVTIMEO = 20
 comptime SO_SNDTIMEO = 21
+# SO_REUSEPORT lets multiple sockets bind to the same (addr, port)
+# and the kernel load-balances incoming connections across them.
+# The scaling primitive for socket-mojo today: spawn N processes,
+# each with its own Ring + listener bound with reuseport=True.
+comptime SO_REUSEPORT = 15
 
 comptime TCP_NODELAY = 1
 comptime TCP_CORK = 3
@@ -193,8 +191,8 @@ def sys_connect(
 @always_inline
 def sys_accept4(
     fd: Int32,
-    addr: UnsafePointer[UInt8, MutAnyOrigin],
-    addr_len: UnsafePointer[UInt32, MutAnyOrigin],
+    addr: UnsafePointer[UInt8, _],
+    addr_len: UnsafePointer[UInt32, _],
     flags: Int,
 ) -> Int:
     """accept4(2): atomically apply SOCK_CLOEXEC / SOCK_NONBLOCK to
@@ -206,8 +204,8 @@ def sys_accept4(
 @always_inline
 def sys_getsockname(
     fd: Int32,
-    addr: UnsafePointer[UInt8, MutAnyOrigin],
-    addr_len: UnsafePointer[UInt32, MutAnyOrigin],
+    addr: UnsafePointer[UInt8, _],
+    addr_len: UnsafePointer[UInt32, _],
 ) -> Int:
     return syscall(SYS_getsockname, Int(fd), Int(addr), Int(addr_len))
 
@@ -224,7 +222,7 @@ def sys_send(
 @always_inline
 def sys_recv(
     fd: Int32,
-    buf: UnsafePointer[UInt8, MutAnyOrigin],
+    buf: UnsafePointer[UInt8, _],
     n: Int,
     flags: Int,
 ) -> Int:
@@ -248,11 +246,11 @@ def sys_sendto(
 @always_inline
 def sys_recvfrom(
     fd: Int32,
-    buf: UnsafePointer[UInt8, MutAnyOrigin],
+    buf: UnsafePointer[UInt8, _],
     n: Int,
     flags: Int,
-    addr: UnsafePointer[UInt8, MutAnyOrigin],
-    addr_len: UnsafePointer[UInt32, MutAnyOrigin],
+    addr: UnsafePointer[UInt8, _],
+    addr_len: UnsafePointer[UInt32, _],
 ) -> Int:
     return syscall(
         SYS_recvfrom, Int(fd), Int(buf), n, flags, Int(addr), Int(addr_len)
@@ -268,7 +266,7 @@ def sys_writev(
 
 @always_inline
 def sys_readv(
-    fd: Int32, iov: UnsafePointer[UInt8, MutAnyOrigin], iovcnt: Int
+    fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int
 ) -> Int:
     return syscall(SYS_readv, Int(fd), Int(iov), iovcnt)
 
@@ -316,7 +314,7 @@ def sys_epoll_ctl(
 @always_inline
 def sys_epoll_pwait(
     epfd: Int32,
-    events: UnsafePointer[UInt8, MutAnyOrigin],
+    events: UnsafePointer[UInt8, _],
     max_events: Int,
     timeout_ms: Int,
 ) -> Int:
@@ -340,7 +338,7 @@ def sys_socketpair(
     domain: Int,
     type_: Int,
     protocol: Int,
-    out_pair: UnsafePointer[UInt8, MutAnyOrigin],
+    out_pair: UnsafePointer[UInt8, _],
 ) -> Int:
     return syscall(
         SYS_socketpair, domain, type_, protocol, Int(out_pair)
@@ -388,14 +386,14 @@ def sys_openat(
 
 @always_inline
 def sys_read(
-    fd: Int32, buf: UnsafePointer[UInt8, MutAnyOrigin], n: Int
+    fd: Int32, buf: UnsafePointer[UInt8, _], n: Int
 ) -> Int:
     return syscall(SYS_read, Int(fd), Int(buf), n)
 
 
 @always_inline
 def sys_getrandom(
-    buf: UnsafePointer[UInt8, MutAnyOrigin], n: Int, flags: Int
+    buf: UnsafePointer[UInt8, _], n: Int, flags: Int
 ) -> Int:
     return syscall(SYS_getrandom, Int(buf), n, flags)
 

@@ -69,6 +69,7 @@ comptime OP_CLOSE = UInt8(19)
 comptime OP_SEND = UInt8(26)
 comptime OP_RECV = UInt8(27)
 comptime OP_SHUTDOWN = UInt8(34)
+comptime OP_MSG_RING = UInt8(40)
 comptime OP_SOCKET = UInt8(45)
 comptime OP_SEND_ZC = UInt8(47)
 

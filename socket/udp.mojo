@@ -64,7 +64,10 @@ struct UdpSocket(Movable):
         )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr(), addr.ip.is_v6, addr.ip.octets, addr.port
+            sa.unsafe_ptr().as_unsafe_any_origin(),
+            addr.ip.is_v6,
+            addr.ip.octets,
+            addr.port,
         )
         var rv = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
@@ -89,7 +92,10 @@ struct UdpSocket(Movable):
         send_to/recv_from for symmetry)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr(), peer.ip.is_v6, peer.ip.octets, peer.port
+            sa.unsafe_ptr().as_unsafe_any_origin(),
+            peer.ip.is_v6,
+            peer.ip.octets,
+            peer.port,
         )
         var rv = sys_connect(self.fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
@@ -103,7 +109,10 @@ struct UdpSocket(Movable):
         userland)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr(), peer.ip.is_v6, peer.ip.octets, peer.port
+            sa.unsafe_ptr().as_unsafe_any_origin(),
+            peer.ip.is_v6,
+            peer.ip.octets,
+            peer.port,
         )
         var n: Int
         while True:

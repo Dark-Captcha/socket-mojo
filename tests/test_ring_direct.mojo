@@ -65,7 +65,9 @@ def _listening_socket(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var alen = write_sockaddr(
+        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+    )
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring_direct: bind " + errno_message(Int32(-brc)))

@@ -149,7 +149,7 @@ struct Poller(Movable):
         if oneshot:
             events |= UInt32(EPOLLONESHOT)
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
-        _write_event(ev.unsafe_ptr(), events, fd)
+        _write_event(ev.unsafe_ptr().as_unsafe_any_origin(), events, fd)
         var rv = sys_epoll_ctl(self.epfd, op, fd, ev.unsafe_ptr())
         if rv != 0:
             raise Error(

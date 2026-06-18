@@ -59,7 +59,9 @@ def _pair(port: UInt16) raises -> Tuple[Int32, Int32]:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var alen = write_sockaddr(
+        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+    )
     var brc = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("bench: bind " + errno_message(Int32(-brc)))
@@ -337,7 +339,9 @@ def _pair_listener(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var alen = write_sockaddr(
+        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+    )
     _ = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
     _ = sys_listen(lfd, 256)
     return lfd

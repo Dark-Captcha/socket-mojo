@@ -246,7 +246,10 @@ def _connected_socket(server: SocketAddr, socktype: Int) raises -> Int32:
     var fd = Int32(rc)
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var alen = write_sockaddr(
-        sa.unsafe_ptr(), server.ip.is_v6, server.ip.octets, server.port
+        sa.unsafe_ptr().as_unsafe_any_origin(),
+        server.ip.is_v6,
+        server.ip.octets,
+        server.port,
     )
     var crc = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
     if crc != 0:

@@ -50,6 +50,7 @@ from socket.uring_sys import (
     OP_CLOSE,
     OP_CONNECT,
     OP_LINK_TIMEOUT,
+    OP_MSG_RING,
     OP_NOP,
     OP_RECV,
     OP_SEND,
@@ -91,6 +92,14 @@ comptime KIND_SOCKET = UInt8(14)
 # drains. The slot stays alive across both so the user-passed
 # buffer survives the kernel's retransmit window.
 comptime KIND_SEND_ZC = UInt8(15)
+# Cross-ring messaging. KIND_MSG_RING is the LOCAL CQE the sender
+# gets back (an ack: res = 0 on delivery, -errno on failure).
+# KIND_MSG_INCOMING is the CQE the kernel posts on the TARGET ring;
+# it has no associated local slot (the sender constructed the
+# target's user_data, not the engine), so next_completion() surfaces
+# it verbatim without slot lookup.
+comptime KIND_MSG_RING = UInt8(16)
+comptime KIND_MSG_INCOMING = UInt8(17)
 
 
 @always_inline
@@ -125,6 +134,10 @@ def _kind_name(kind: UInt8) -> String:
         return "socket-direct"
     if kind == KIND_SEND_ZC:
         return "send-zc"
+    if kind == KIND_MSG_RING:
+        return "msg-ring"
+    if kind == KIND_MSG_INCOMING:
+        return "msg-incoming"
     return "nop"
 
 
@@ -284,6 +297,54 @@ struct Ring(Movable):
         from. 16 KiB default matches the TLS record ceiling."""
         self.bufs = BufRing(self.q.fd, bgid, entries, buf_size)
 
+    @always_inline
+    def fd(self) -> Int32:
+        """The underlying io_uring fd. Pass to another Ring's
+        `msg_ring()` to deliver a cross-thread CQE here."""
+        return self.q.fd
+
+    def msg_ring(
+        mut self,
+        target_ring_fd: Int32,
+        payload: UInt64,
+        target_res: Int32 = 0,
+    ) raises -> OpId:
+        """Post a CQE on `target_ring_fd` (a different Ring's io_uring
+        fd). The target's next reap surfaces a KIND_MSG_INCOMING
+        completion carrying `payload` (low 56 bits) and `target_res`.
+        Top 8 bits of the target's user_data are reserved by the engine
+        for the kind tag — callers must keep their payload below 2^56.
+        The local CQE this op posts is just a delivery ack (res = 0 on
+        success). Cross-thread / cross-ring signalling primitive
+        (Linux 5.18+)."""
+        if (payload & (UInt64(0xFF) << 56)) != 0:
+            raise Error(
+                "socket.ring: msg_ring payload must fit in the low 56 bits"
+            )
+        self._room()
+        var idx = self._alloc(KIND_MSG_RING, target_ring_fd, List[UInt8]())
+        var local_ud = self._user_data(idx, KIND_MSG_RING)
+        # Target sees this user_data verbatim — tag with KIND_MSG_INCOMING
+        # in the top 8 bits so the receiver's next_completion() handles
+        # it without a slot lookup.
+        var target_ud = payload | (UInt64(KIND_MSG_INCOMING) << 56)
+        # SQE for OP_MSG_RING (io_uring/msg_ring.c):
+        #   sqe.fd  = target ring fd          (push_sqe `fd`)
+        #   sqe.addr = mode (0 = MSG_DATA)    (push_sqe `addr`)
+        #   sqe.len = res to post on target   (push_sqe `length`)
+        #   sqe.off = user_data on target     (push_sqe `off_or_addr2`)
+        self.q.push_sqe(
+            OP_MSG_RING,
+            target_ring_fd,
+            0,
+            UInt32(Int(target_res)),
+            target_ud,
+            0,
+            local_ud,
+        )
+        self.inflight += 1
+        return OpId(local_ud)
+
     def buffer_view(
         mut self, bid: Int, length: Int
     ) raises -> Span[UInt8, MutAnyOrigin]:
@@ -300,10 +361,14 @@ struct Ring(Movable):
             or length > self.bufs.value().buf_size
         ):
             raise Error("socket.ring: buffer_view bid/length out of range")
-        var p: UnsafePointer[UInt8, MutAnyOrigin] = (
+        # The backing buffer is owned by the BufRing held inside the
+        # Ring; the caller-visible Span lives only until recycle_buffer
+        # is called. We discard the natural origin explicitly so the
+        # Span type doesn't leak the BufRing's lifetime into callers.
+        var p = (
             self.bufs.value().backing.unsafe_ptr()
             + bid * self.bufs.value().buf_size
-        )
+        ).as_unsafe_any_origin()
         return Span(ptr=p, length=length)
 
     def recycle_buffer(mut self, bid: Int) raises:
@@ -418,7 +483,10 @@ struct Ring(Movable):
         self._room()
         var st = List[UInt8](length=SOCKADDR_STORAGE_SIZE, fill=0)
         var alen = write_sockaddr(
-            st.unsafe_ptr(), addr.ip.is_v6, addr.ip.octets, addr.port
+            st.unsafe_ptr().as_unsafe_any_origin(),
+            addr.ip.is_v6,
+            addr.ip.octets,
+            addr.port,
         )
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
         var idx = self._alloc(KIND_CONNECT, fd, st^)
@@ -766,9 +834,22 @@ struct Ring(Movable):
             if not self.q.cqe_pending():
                 return None
             var cqe = self.q.pop_cqe()
+            var kind = UInt8((cqe.user_data >> 56) & 0xFF)
+            # External msg_ring CQE: the sender packed KIND_MSG_INCOMING
+            # in the top 8 bits and the low 56 bits are their payload —
+            # there's no local slot to look up.
+            if kind == KIND_MSG_INCOMING:
+                return Completion(
+                    OpId(cqe.user_data),
+                    kind,
+                    Int32(-1),
+                    cqe.res,
+                    List[UInt8](),
+                    -1,
+                    False,
+                )
             var idx = Int(cqe.user_data & 0xFFFFFFFF)
             var gen = UInt32((cqe.user_data >> 32) & 0xFFFFFF)
-            var kind = UInt8((cqe.user_data >> 56) & 0xFF)
             if idx >= len(self.slots) or not self.slots[idx].active:
                 raise Error("socket.ring: completion for unknown slot")
             if (self.slots[idx].gen & 0xFFFFFF) != gen:

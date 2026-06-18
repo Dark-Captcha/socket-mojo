@@ -29,6 +29,8 @@ from socket.ring import (
     KIND_CANCEL,
     KIND_CLOSE,
     KIND_CONNECT,
+    KIND_MSG_INCOMING,
+    KIND_MSG_RING,
     KIND_NOP,
     KIND_RECV,
     KIND_RECV_MULTI,
@@ -64,7 +66,9 @@ def _listening_socket(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var alen = write_sockaddr(
+        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+    )
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring: bind() " + errno_message(Int32(-brc)))
@@ -367,11 +371,46 @@ def _test_timers() raises:
     print("  timers + deadlines: OK")
 
 
+def _test_msg_ring() raises:
+    # OP_MSG_RING posts a CQE on a SECOND ring, in the same process
+    # for this test (cross-thread is the real use case). Top 8 bits
+    # of payload are reserved by the engine for the kind tag.
+    var a = Ring(16)
+    var b = Ring(16)
+    var op = a.msg_ring(b.fd(), UInt64(0xDEAD_BEEF), 0x4242)
+    _ = a.wait(min_complete=1)
+    var ca = a.next_completion()
+    var ack = ca.take()
+    ack.ok()
+    check(ack.kind == KIND_MSG_RING, "msg-ring: local ack kind")
+    check(ack.op == op, "msg-ring: ack op id")
+    # Now reap the message on the target ring.
+    _ = b.wait(min_complete=1)
+    var cb = b.next_completion()
+    var incoming = cb.take()
+    check(incoming.kind == KIND_MSG_INCOMING, "msg-ring: target kind")
+    check(
+        Int(incoming.res) == 0x4242,
+        "msg-ring: target carried `res` payload",
+    )
+    var got_payload = incoming.op.raw & ((UInt64(1) << 56) - 1)
+    check(
+        got_payload == UInt64(0xDEAD_BEEF),
+        "msg-ring: target carried 56-bit payload",
+    )
+    check(
+        Bool(not b.next_completion()),
+        "msg-ring: target CQ drained",
+    )
+    print("  cross-ring msg_ring: OK")
+
+
 def run() raises:
     _test_nop_batch()
     _test_loopback_echo()
     _test_multishot_and_buffers()
     _test_timers()
+    _test_msg_ring()
     _test_external_echo()
     print("test_ring: OK")
 

@@ -32,6 +32,22 @@ the `epoll_wait` cost without recouping it on a single fd.
 |  64 conns | 143 k/s | 160 k/s (+12%) | 142 k/s | 162 k/s (+13%) |
 | 256 conns | 133 k/s | 154 k/s (+16%) | 137 k/s | 156 k/s (+17%) |
 
+## Two-process loopback (closer to real NIC behaviour)
+
+`./benchmarks/run_bench_proc.sh`: separate Mojo server + Mojo client
+processes, kernel TCP between them. The in-process bench above
+takes the same-process shortcut path; this one exercises the full
+socket layer.
+
+|        | client-measured rate |
+|-------:|---------------------:|
+|  64 conns × 2000 rounds | ~267 k rt/s |
+
+(Client's perspective: one `send + recv` per round. Not directly
+comparable to the in-process row above, which counts both sides
+through one Ring. The two-process shape is the more honest proxy
+for what users will see in production deployments.)
+
 Per-connection rate stays flat across 8 → 256 conns: one ring
 drives 256 simultaneous echo flows with no measurable degradation,
 where the same workload on epoll would require explicit edge-

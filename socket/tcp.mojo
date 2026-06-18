@@ -31,6 +31,7 @@ from socket._syscalls import (
     SO_RCVBUF,
     SO_RCVTIMEO,
     SO_REUSEADDR,
+    SO_REUSEPORT,
     SO_SNDBUF,
     SO_SNDTIMEO,
     TCP_NODELAY,
@@ -103,7 +104,10 @@ struct TcpSocket(Movable):
             var fd = Int32(rc)
             var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
             var alen = write_sockaddr(
-                sa.unsafe_ptr(), ip.is_v6, ip.octets, port
+                sa.unsafe_ptr().as_unsafe_any_origin(),
+                ip.is_v6,
+                ip.octets,
+                port,
             )
             # The kernel-default connect timeout can be many minutes;
             # we set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the
@@ -357,10 +361,19 @@ struct TcpListener(Movable):
             _ = sys_close(self.fd)
 
     @staticmethod
-    def bind(addr: SocketAddr, *, backlog: Int = 128) raises -> TcpListener:
+    def bind(
+        addr: SocketAddr,
+        *,
+        backlog: Int = 128,
+        reuseport: Bool = False,
+    ) raises -> TcpListener:
         """Bind and start listening on `addr`. SO_REUSEADDR is enabled
         so a recently-stopped server can rebind without TIME_WAIT
-        delay."""
+        delay. With `reuseport=True`, multiple processes can bind the
+        same (addr, port) and the kernel load-balances incoming
+        connections — the standard recipe for thread-per-core / one-
+        Ring-per-CPU scaling without crossing process boundaries on
+        the data path."""
         var family = AF_INET6 if addr.ip.is_v6 else AF_INET
         var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
         if rc < 0:
@@ -374,9 +387,20 @@ struct TcpListener(Movable):
             UnsafePointer(to=one).bitcast[UInt8](),
             4,
         )
+        if reuseport:
+            _ = sys_setsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_REUSEPORT,
+                UnsafePointer(to=one).bitcast[UInt8](),
+                4,
+            )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr(), addr.ip.is_v6, addr.ip.octets, addr.port
+            sa.unsafe_ptr().as_unsafe_any_origin(),
+            addr.ip.is_v6,
+            addr.ip.octets,
+            addr.port,
         )
         var rv = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
