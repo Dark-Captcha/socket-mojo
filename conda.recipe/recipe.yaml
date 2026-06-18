@@ -8,7 +8,7 @@ package:
 
 source:
   - git: https://github.com/Dark-Captcha/socket-mojo.git
-    rev: PLACEHOLDER_SHA
+    rev: 21ddac6a6b55c2069514b4ac271a502677839590
 
 build:
   number: 0
