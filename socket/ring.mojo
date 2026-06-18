@@ -34,7 +34,7 @@ from socket._syscalls import (
 )
 from socket.addr import IpAddress, SocketAddr
 from socket.bufring import BufRing
-from socket._syscalls import SYS_io_uring_register, syscall
+from socket._syscalls import SYS_IO_URING_REGISTER, syscall
 from socket.uring_sys import (
     ACCEPT_MULTISHOT,
     CQE_BUFFER_SHIFT,
@@ -393,7 +393,7 @@ struct Ring(Movable):
         # every i32 read as -1.
         var fds = List[UInt8](length=count * 4, fill=0xFF)
         var rc = syscall(
-            SYS_io_uring_register,
+            SYS_IO_URING_REGISTER,
             Int(self.q.fd),
             REGISTER_FILES,
             Int(fds.unsafe_ptr()),
@@ -411,7 +411,7 @@ struct Ring(Movable):
         """Tear down the registered fd table. Any direct fds become
         invalid; callers should close_direct them first."""
         var rc = syscall(
-            SYS_io_uring_register,
+            SYS_IO_URING_REGISTER,
             Int(self.q.fd),
             UNREGISTER_FILES,
             0,

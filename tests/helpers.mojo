@@ -1,15 +1,14 @@
-# Test assertions shared across all socket-mojo tests.
+# Test assertion shared across all socket-mojo tests.
+#
+# Returns 0 on pass, 1 on fail (prints a marker on fail). Each test
+# `run() raises -> Int` sums these to produce a failure count;
+# tests/run_tests.mojo sums the per-file counts to report total
+# failures. Tests don't stop on the first failure — every check
+# runs so you see the full picture.
 
 
-def check(cond: Bool, name: String) raises:
+def check(cond: Bool, name: String) -> Int:
     if not cond:
-        raise Error("FAIL: " + name)
-
-
-def check_eq[
-    T: EqualityComparable & Stringable
-](got: T, want: T, name: String) raises:
-    if got != want:
-        raise Error(
-            "FAIL: " + name + " got " + String(got) + " want " + String(want)
-        )
+        print("FAIL:", name)
+        return 1
+    return 0

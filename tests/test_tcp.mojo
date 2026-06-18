@@ -8,7 +8,9 @@ from socket.tcp import TcpSocket
 from tests.helpers import check
 
 
-def run() raises:
+def run() raises -> Int:
+    var f = 0
+
     # The shell harness above this test starts a Python echo server on
     # 127.0.0.1:PORT_FROM_ENV. We hardcode the port and assume the
     # server is up. If you run this standalone, see the run_tests
@@ -19,9 +21,13 @@ def run() raises:
     sock.write(msg.as_bytes())
     var got_bytes = sock.read_exact(msg.byte_length())
     var got = String(unsafe_from_utf8=got_bytes)
-    check(got == msg, "echo round trip: " + got)
-    print("test_tcp: OK (echoed " + String(msg.byte_length()) + " bytes)")
+    f += check(got == msg, "echo round trip: " + got)
+    if f == 0:
+        print("test_tcp: OK (echoed " + String(msg.byte_length()) + " bytes)")
+    return f
 
 
 def main() raises:
-    run()
+    var fails = run()
+    if fails > 0:
+        raise Error("test_tcp: " + String(fails) + " failures")

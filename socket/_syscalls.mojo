@@ -42,34 +42,34 @@ def syscall(
 
 # --- Linux x86_64 syscall numbers (stable across kernel versions) -----
 
-comptime SYS_read = 0
-comptime SYS_write = 1
-comptime SYS_close = 3
-comptime SYS_mmap = 9
-comptime SYS_munmap = 11
-comptime SYS_readv = 19
-comptime SYS_writev = 20
-comptime SYS_socket = 41
-comptime SYS_connect = 42
-comptime SYS_accept = 43
-comptime SYS_sendto = 44
-comptime SYS_recvfrom = 45
-comptime SYS_shutdown = 48
-comptime SYS_bind = 49
-comptime SYS_listen = 50
-comptime SYS_getsockname = 51
-comptime SYS_socketpair = 53
-comptime SYS_setsockopt = 54
-comptime SYS_fcntl = 72
-comptime SYS_epoll_ctl = 233
-comptime SYS_openat = 257
-comptime SYS_accept4 = 288
-comptime SYS_epoll_pwait = 281
-comptime SYS_epoll_create1 = 291
-comptime SYS_getrandom = 318
-comptime SYS_io_uring_setup = 425
-comptime SYS_io_uring_enter = 426
-comptime SYS_io_uring_register = 427
+comptime SYS_READ = 0
+comptime SYS_WRITE = 1
+comptime SYS_CLOSE = 3
+comptime SYS_MMAP = 9
+comptime SYS_MUNMAP = 11
+comptime SYS_READV = 19
+comptime SYS_WRITEV = 20
+comptime SYS_SOCKET = 41
+comptime SYS_CONNECT = 42
+comptime SYS_ACCEPT = 43
+comptime SYS_SENDTO = 44
+comptime SYS_RECVFROM = 45
+comptime SYS_SHUTDOWN = 48
+comptime SYS_BIND = 49
+comptime SYS_LISTEN = 50
+comptime SYS_GETSOCKNAME = 51
+comptime SYS_SOCKETPAIR = 53
+comptime SYS_SETSOCKOPT = 54
+comptime SYS_FCNTL = 72
+comptime SYS_EPOLL_CTL = 233
+comptime SYS_OPENAT = 257
+comptime SYS_ACCEPT4 = 288
+comptime SYS_EPOLL_PWAIT = 281
+comptime SYS_EPOLL_CREATE1 = 291
+comptime SYS_GETRANDOM = 318
+comptime SYS_IO_URING_SETUP = 425
+comptime SYS_IO_URING_ENTER = 426
+comptime SYS_IO_URING_REGISTER = 427
 
 
 # --- socket API constants (Linux UAPI) --------------------------------
@@ -161,31 +161,31 @@ comptime SOCKADDR_STORAGE_SIZE = 28
 def sys_socket(domain: Int, type_: Int, protocol: Int) -> Int:
     """SOCK_CLOEXEC is OR'd into type_ by callers that need it; this
     wrapper passes everything through verbatim."""
-    return syscall(SYS_socket, domain, type_, protocol)
+    return syscall(SYS_SOCKET, domain, type_, protocol)
 
 
 @always_inline
 def sys_close(fd: Int32) -> Int:
-    return syscall(SYS_close, Int(fd))
+    return syscall(SYS_CLOSE, Int(fd))
 
 
 @always_inline
 def sys_bind(
     fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int
 ) -> Int:
-    return syscall(SYS_bind, Int(fd), Int(addr), addr_len)
+    return syscall(SYS_BIND, Int(fd), Int(addr), addr_len)
 
 
 @always_inline
 def sys_listen(fd: Int32, backlog: Int) -> Int:
-    return syscall(SYS_listen, Int(fd), backlog)
+    return syscall(SYS_LISTEN, Int(fd), backlog)
 
 
 @always_inline
 def sys_connect(
     fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int
 ) -> Int:
-    return syscall(SYS_connect, Int(fd), Int(addr), addr_len)
+    return syscall(SYS_CONNECT, Int(fd), Int(addr), addr_len)
 
 
 @always_inline
@@ -198,7 +198,7 @@ def sys_accept4(
     """accept4(2): atomically apply SOCK_CLOEXEC / SOCK_NONBLOCK to
     the accepted fd. Avoids the race between accept(2) and a follow-
     up fcntl that the plain accept(2) creates."""
-    return syscall(SYS_accept4, Int(fd), Int(addr), Int(addr_len), flags)
+    return syscall(SYS_ACCEPT4, Int(fd), Int(addr), Int(addr_len), flags)
 
 
 @always_inline
@@ -207,7 +207,7 @@ def sys_getsockname(
     addr: UnsafePointer[UInt8, _],
     addr_len: UnsafePointer[UInt32, _],
 ) -> Int:
-    return syscall(SYS_getsockname, Int(fd), Int(addr), Int(addr_len))
+    return syscall(SYS_GETSOCKNAME, Int(fd), Int(addr), Int(addr_len))
 
 
 @always_inline
@@ -216,7 +216,7 @@ def sys_send(
 ) -> Int:
     """Linux exposes `send` as `sendto` with NULL addr — there is no
     separate `send` syscall on x86_64."""
-    return syscall(SYS_sendto, Int(fd), Int(buf), n, flags, 0, 0)
+    return syscall(SYS_SENDTO, Int(fd), Int(buf), n, flags, 0, 0)
 
 
 @always_inline
@@ -226,7 +226,7 @@ def sys_recv(
     n: Int,
     flags: Int,
 ) -> Int:
-    return syscall(SYS_recvfrom, Int(fd), Int(buf), n, flags, 0, 0)
+    return syscall(SYS_RECVFROM, Int(fd), Int(buf), n, flags, 0, 0)
 
 
 @always_inline
@@ -239,7 +239,7 @@ def sys_sendto(
     addr_len: Int,
 ) -> Int:
     return syscall(
-        SYS_sendto, Int(fd), Int(buf), n, flags, Int(addr), addr_len
+        SYS_SENDTO, Int(fd), Int(buf), n, flags, Int(addr), addr_len
     )
 
 
@@ -253,7 +253,7 @@ def sys_recvfrom(
     addr_len: UnsafePointer[UInt32, _],
 ) -> Int:
     return syscall(
-        SYS_recvfrom, Int(fd), Int(buf), n, flags, Int(addr), Int(addr_len)
+        SYS_RECVFROM, Int(fd), Int(buf), n, flags, Int(addr), Int(addr_len)
     )
 
 
@@ -261,14 +261,14 @@ def sys_recvfrom(
 def sys_writev(
     fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int
 ) -> Int:
-    return syscall(SYS_writev, Int(fd), Int(iov), iovcnt)
+    return syscall(SYS_WRITEV, Int(fd), Int(iov), iovcnt)
 
 
 @always_inline
 def sys_readv(
     fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int
 ) -> Int:
-    return syscall(SYS_readv, Int(fd), Int(iov), iovcnt)
+    return syscall(SYS_READV, Int(fd), Int(iov), iovcnt)
 
 
 @always_inline
@@ -280,35 +280,35 @@ def sys_setsockopt(
     val_len: Int,
 ) -> Int:
     return syscall(
-        SYS_setsockopt, Int(fd), level, name, Int(val), val_len
+        SYS_SETSOCKOPT, Int(fd), level, name, Int(val), val_len
     )
 
 
 @always_inline
 def sys_shutdown(fd: Int32, how: Int) -> Int:
-    return syscall(SYS_shutdown, Int(fd), how)
+    return syscall(SYS_SHUTDOWN, Int(fd), how)
 
 
 @always_inline
 def sys_fcntl_getfl(fd: Int32) -> Int:
-    return syscall(SYS_fcntl, Int(fd), F_GETFL, 0)
+    return syscall(SYS_FCNTL, Int(fd), F_GETFL, 0)
 
 
 @always_inline
 def sys_fcntl_setfl(fd: Int32, flags: Int) -> Int:
-    return syscall(SYS_fcntl, Int(fd), F_SETFL, flags)
+    return syscall(SYS_FCNTL, Int(fd), F_SETFL, flags)
 
 
 @always_inline
 def sys_epoll_create1(flags: Int) -> Int:
-    return syscall(SYS_epoll_create1, flags)
+    return syscall(SYS_EPOLL_CREATE1, flags)
 
 
 @always_inline
 def sys_epoll_ctl(
     epfd: Int32, op: Int, fd: Int32, event: UnsafePointer[UInt8, _]
 ) -> Int:
-    return syscall(SYS_epoll_ctl, Int(epfd), op, Int(fd), Int(event))
+    return syscall(SYS_EPOLL_CTL, Int(epfd), op, Int(fd), Int(event))
 
 
 @always_inline
@@ -323,7 +323,7 @@ def sys_epoll_pwait(
     (the size of a kernel sigset_t on x86_64) to get vanilla epoll_wait
     semantics."""
     return syscall(
-        SYS_epoll_pwait,
+        SYS_EPOLL_PWAIT,
         Int(epfd),
         Int(events),
         max_events,
@@ -341,7 +341,7 @@ def sys_socketpair(
     out_pair: UnsafePointer[UInt8, _],
 ) -> Int:
     return syscall(
-        SYS_socketpair, domain, type_, protocol, Int(out_pair)
+        SYS_SOCKETPAIR, domain, type_, protocol, Int(out_pair)
     )
 
 
@@ -356,7 +356,7 @@ def sys_mmap(
 ) -> Int:
     """Returns the mapped address (as an Int) or `-errno` in the
     failure range. Use `is_syscall_error(rc)` to distinguish."""
-    return syscall(SYS_mmap, addr, length, prot, flags, Int(fd), offset)
+    return syscall(SYS_MMAP, addr, length, prot, flags, Int(fd), offset)
 
 
 def sys_mmap_or_raise(
@@ -374,28 +374,28 @@ def sys_mmap_or_raise(
 
 @always_inline
 def sys_munmap(addr: UnsafePointer[UInt8, _], length: Int) -> Int:
-    return syscall(SYS_munmap, Int(addr), length)
+    return syscall(SYS_MUNMAP, Int(addr), length)
 
 
 @always_inline
 def sys_openat(
     dirfd: Int, path: UnsafePointer[UInt8, _], flags: Int, mode: Int = 0
 ) -> Int:
-    return syscall(SYS_openat, dirfd, Int(path), flags, mode)
+    return syscall(SYS_OPENAT, dirfd, Int(path), flags, mode)
 
 
 @always_inline
 def sys_read(
     fd: Int32, buf: UnsafePointer[UInt8, _], n: Int
 ) -> Int:
-    return syscall(SYS_read, Int(fd), Int(buf), n)
+    return syscall(SYS_READ, Int(fd), Int(buf), n)
 
 
 @always_inline
 def sys_getrandom(
     buf: UnsafePointer[UInt8, _], n: Int, flags: Int
 ) -> Int:
-    return syscall(SYS_getrandom, Int(buf), n, flags)
+    return syscall(SYS_GETRANDOM, Int(buf), n, flags)
 
 
 # --- error helpers ----------------------------------------------------

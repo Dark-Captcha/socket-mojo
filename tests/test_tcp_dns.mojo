@@ -6,19 +6,24 @@ from socket.tcp import TcpSocket
 from tests.helpers import check
 
 
-def run() raises:
+def run() raises -> Int:
+    var f = 0
     var sock = TcpSocket.connect(
         "localhost", UInt16(19502), timeout_seconds=2.0
     )
     var msg = "hostname resolution works".as_bytes()
     sock.write(msg)
     var got = sock.read_exact(len(msg))
-    check(
+    f += check(
         String(unsafe_from_utf8=Span(got)) == String(unsafe_from_utf8=msg),
         "echo over DNS-resolved hostname",
     )
-    print("test_tcp_dns: OK (DNS + connect + echo)")
+    if f == 0:
+        print("test_tcp_dns: OK (DNS + connect + echo)")
+    return f
 
 
 def main() raises:
-    run()
+    var fails = run()
+    if fails > 0:
+        raise Error("test_tcp_dns: " + String(fails) + " failures")

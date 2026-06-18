@@ -77,16 +77,18 @@ def _listening_socket(port: UInt16) raises -> Int32:
     return fd
 
 
-def _test_register_files_lifecycle() raises:
+def _test_register_files_lifecycle() raises -> Int:
     var ring = Ring(32)
     ring.register_files(64)
     ring.unregister_files()
     # Reuse: register again, then drop the ring (kernel auto-cleans).
     ring.register_files(16)
     print("  register/unregister: OK")
+    return 0
 
 
-def _test_accept_direct_echo() raises:
+def _test_accept_direct_echo() raises -> Int:
+    var f = 0
     var ring = Ring(64)
     ring.register_files(32)
     var port = UInt16(19620)
@@ -104,24 +106,24 @@ def _test_accept_direct_echo() raises:
     var saw_connect = False
     for _ in range(2):
         var c = ring.next_completion()
-        check(Bool(c), "direct: accept/connect completion present")
+        f += check(Bool(c), "direct: accept/connect completion present")
         var done = c.take()
         done.ok()
         if done.kind == KIND_ACCEPT_DIRECT:
-            check(done.op == accept_op, "direct: accept op id matches")
+            f += check(done.op == accept_op, "direct: accept op id matches")
             direct_slot = done.res
             var peer = done.accepted_peer()
-            check(
+            f += check(
                 peer.ip.is_loopback() and peer.port != 0,
                 "direct: peer addr is loopback with a real port",
             )
             saw_accept = True
         else:
-            check(done.kind == KIND_CONNECT, "direct: other op is connect")
-            check(done.op == connect_op, "direct: connect op id matches")
+            f += check(done.kind == KIND_CONNECT, "direct: other op is connect")
+            f += check(done.op == connect_op, "direct: connect op id matches")
             saw_connect = True
-    check(saw_accept and saw_connect, "direct: both ops completed")
-    check(direct_slot >= 0, "direct: kernel allocated a valid slot")
+    f += check(saw_accept and saw_connect, "direct: both ops completed")
+    f += check(direct_slot >= 0, "direct: kernel allocated a valid slot")
 
     # Client sends, the direct-fd server side recvs (fixed=True),
     # echoes back, client reads.
@@ -138,7 +140,7 @@ def _test_accept_direct_echo() raises:
         done.ok()
         if done.kind == KIND_RECV:
             echoed = done.take_buffer()
-    check(len(echoed) == len(payload), "direct: server got full payload")
+    f += check(len(echoed) == len(payload), "direct: server got full payload")
 
     # Echo back via the direct slot.
     _ = ring.send(direct_slot, echoed^, fixed=True)
@@ -151,12 +153,12 @@ def _test_accept_direct_echo() raises:
         done.ok()
         if done.kind == KIND_RECV:
             roundtrip = done.take_buffer()
-    check(len(roundtrip) == len(payload), "direct: client got echo")
+    f += check(len(roundtrip) == len(payload), "direct: client got echo")
     var same = True
     for i in range(len(roundtrip)):
         if roundtrip[i] != payload[i]:
             same = False
-    check(same, "direct: round-trip bytes identical")
+    f += check(same, "direct: round-trip bytes identical")
 
     # Close: direct fd via close_direct, raw fds via close_fd.
     _ = ring.close_fd(direct_slot, fixed=True)
@@ -165,16 +167,19 @@ def _test_accept_direct_echo() raises:
     _ = ring.wait(min_complete=3)
     for _ in range(3):
         var c = ring.next_completion()
-        check(Bool(c), "direct: close completion present")
+        f += check(Bool(c), "direct: close completion present")
         var done = c.take()
         done.ok()
-        check(done.kind == KIND_CLOSE, "direct: close kind")
-    check(ring.inflight == 0, "direct: drained")
+        f += check(done.kind == KIND_CLOSE, "direct: close kind")
+    f += check(ring.inflight == 0, "direct: drained")
     ring.unregister_files()
-    print("  accept_direct + fixed I/O + close_direct: OK")
+    if f == 0:
+        print("  accept_direct + fixed I/O + close_direct: OK")
+    return f
 
 
-def _test_accept_multishot_direct() raises:
+def _test_accept_multishot_direct() raises -> Int:
+    var f = 0
     var ring = Ring(64)
     ring.register_files(16)
     var port = UInt16(19621)
@@ -194,20 +199,20 @@ def _test_accept_multishot_direct() raises:
     var more_seen = 0
     for _ in range(6):
         var c = ring.next_completion()
-        check(Bool(c), "direct-ms: completion present")
+        f += check(Bool(c), "direct-ms: completion present")
         var done = c.take()
         done.ok()
         if done.kind == KIND_ACCEPT_MULTI_DIRECT:
-            check(done.op == ms_accept, "direct-ms: accept op id")
+            f += check(done.op == ms_accept, "direct-ms: accept op id")
             direct_slots.append(done.res)
             if done.more:
                 more_seen += 1
-    check(len(direct_slots) == 3, "direct-ms: three direct slots")
-    check(more_seen == 3, "direct-ms: F_MORE on each multishot accept")
+    f += check(len(direct_slots) == 3, "direct-ms: three direct slots")
+    f += check(more_seen == 3, "direct-ms: F_MORE on each multishot accept")
     # The kernel must allocate distinct slot indices.
     for i in range(len(direct_slots)):
         for j in range(i + 1, len(direct_slots)):
-            check(
+            f += check(
                 direct_slots[i] != direct_slots[j],
                 "direct-ms: slots are unique",
             )
@@ -229,12 +234,15 @@ def _test_accept_multishot_direct() raises:
         if not c:
             break
         _ = c.take()
-    check(ring.inflight == 0, "direct-ms: drained")
+    f += check(ring.inflight == 0, "direct-ms: drained")
     ring.unregister_files()
-    print("  accept_multishot_direct: OK")
+    if f == 0:
+        print("  accept_multishot_direct: OK")
+    return f
 
 
-def _test_socket_direct_connect_and_io() raises:
+def _test_socket_direct_connect_and_io() raises -> Int:
+    var f = 0
     # OP_SOCKET allocates a fresh socket directly into the registered
     # table; OP_CONNECT with fixed=True wires it up. Once connected,
     # the same slot drives recv/send.
@@ -255,9 +263,9 @@ def _test_socket_direct_connect_and_io() raises:
         var done = c.take()
         done.ok()
         if done.kind == KIND_SOCKET:
-            check(done.op == sock_op, "sock-direct: op id matches")
+            f += check(done.op == sock_op, "sock-direct: op id matches")
             client_slot = done.res
-    check(client_slot >= 0, "sock-direct: kernel allocated a slot")
+    f += check(client_slot >= 0, "sock-direct: kernel allocated a slot")
 
     _ = ring.connect(client_slot, dest, fixed=True)
     _ = ring.wait(min_complete=2)  # accept + connect
@@ -268,7 +276,7 @@ def _test_socket_direct_connect_and_io() raises:
         done.ok()
         if done.op == accept_op:
             server_fd = done.res
-    check(server_fd > 0, "sock-direct: accepted server fd valid")
+    f += check(server_fd > 0, "sock-direct: accepted server fd valid")
 
     # Ping-pong on the fixed-fd client side.
     var msg = String("socket_direct + connect (fixed) ping").as_bytes()
@@ -284,7 +292,7 @@ def _test_socket_direct_connect_and_io() raises:
         done.ok()
         if done.kind == KIND_RECV:
             got = done.take_buffer()
-    check(len(got) == len(msg), "sock-direct: server received full ping")
+    f += check(len(got) == len(msg), "sock-direct: server received full ping")
 
     _ = ring.close_fd(client_slot, fixed=True)
     _ = ring.close_fd(server_fd)
@@ -295,12 +303,15 @@ def _test_socket_direct_connect_and_io() raises:
         if not c:
             break
         _ = c.take()
-    check(ring.inflight == 0, "sock-direct: drained")
+    f += check(ring.inflight == 0, "sock-direct: drained")
     ring.unregister_files()
-    print("  socket_direct + connect (fixed) + I/O: OK")
+    if f == 0:
+        print("  socket_direct + connect (fixed) + I/O: OK")
+    return f
 
 
-def _test_send_zc() raises:
+def _test_send_zc() raises -> Int:
+    var f = 0
     # OP_SEND_ZC posts two CQEs (send done + buffer-reusable notif);
     # the engine surfaces exactly one Completion to the user (the
     # send-done one) and drains the notif silently.
@@ -319,7 +330,7 @@ def _test_send_zc() raises:
         done.ok()
         if done.op == accept_op:
             afd = done.res
-    check(afd > 0, "zc: accept ok")
+    f += check(afd > 0, "zc: accept ok")
 
     # 32 KiB payload — big enough that the kernel really does pin and
     # later release the buffer; small enough to round-trip cleanly
@@ -343,8 +354,8 @@ def _test_send_zc() raises:
         var done = c.take()
         done.ok()
         if done.kind == KIND_SEND_ZC:
-            check(done.op == send_op, "zc: send_zc op id matches")
-            check(Int(done.res) == n, "zc: send_zc reported all bytes")
+            f += check(done.op == send_op, "zc: send_zc op id matches")
+            f += check(Int(done.res) == n, "zc: send_zc reported all bytes")
             send_done = True
 
     var got_n = 0
@@ -355,7 +366,7 @@ def _test_send_zc() raises:
         var done = c.take()
         done.ok()
         got_n += Int(done.res)
-    check(got_n == n, "zc: server got the full payload")
+    f += check(got_n == n, "zc: server got the full payload")
 
     # The notif CQE for the send_zc may arrive any time before the
     # closes — wait for it to drain plus the closes (afd, cfd, lfd).
@@ -368,18 +379,25 @@ def _test_send_zc() raises:
         if not c:
             break
         _ = c.take()
-    check(ring.inflight == 0, "zc: drained (notif consumed internally)")
-    print("  send_zc (two-CQE protocol drained internally): OK")
+    f += check(ring.inflight == 0, "zc: drained (notif consumed internally)")
+    if f == 0:
+        print("  send_zc (two-CQE protocol drained internally): OK")
+    return f
 
 
-def run() raises:
-    _test_register_files_lifecycle()
-    _test_accept_direct_echo()
-    _test_accept_multishot_direct()
-    _test_socket_direct_connect_and_io()
-    _test_send_zc()
-    print("test_ring_direct: OK")
+def run() raises -> Int:
+    var f = 0
+    f += _test_register_files_lifecycle()
+    f += _test_accept_direct_echo()
+    f += _test_accept_multishot_direct()
+    f += _test_socket_direct_connect_and_io()
+    f += _test_send_zc()
+    if f == 0:
+        print("test_ring_direct: OK")
+    return f
 
 
 def main() raises:
-    run()
+    var fails = run()
+    if fails > 0:
+        raise Error("test_ring_direct: " + String(fails) + " failures")

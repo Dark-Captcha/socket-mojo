@@ -18,8 +18,8 @@ from socket._syscalls import (
     MAP_SHARED,
     PROT_READ,
     PROT_WRITE,
-    SYS_io_uring_enter,
-    SYS_io_uring_setup,
+    SYS_IO_URING_ENTER,
+    SYS_IO_URING_SETUP,
     is_syscall_error,
     sys_close,
     sys_mmap_or_raise,
@@ -181,7 +181,7 @@ struct UringQueue(Movable):
             # params.sq_thread_idle @ byte 16
             (params.unsafe_ptr() + 16).bitcast[UInt32]()[0] = sqpoll_idle_ms
         var rc = syscall(
-            SYS_io_uring_setup, entries, Int(params.unsafe_ptr())
+            SYS_IO_URING_SETUP, entries, Int(params.unsafe_ptr())
         )
         if rc < 0:
             raise Error(
@@ -366,7 +366,7 @@ struct UringQueue(Movable):
             if enter_flags == 0:
                 return 0
             var rc = syscall(
-                SYS_io_uring_enter, Int(self.fd), 0, min_complete, enter_flags
+                SYS_IO_URING_ENTER, Int(self.fd), 0, min_complete, enter_flags
             )
             if rc < 0:
                 raise Error(
@@ -378,7 +378,7 @@ struct UringQueue(Movable):
         var n = Int(self.to_submit)
         var flags = Int(ENTER_GETEVENTS) if min_complete > 0 else 0
         var rc = syscall(
-            SYS_io_uring_enter, Int(self.fd), n, min_complete, flags
+            SYS_IO_URING_ENTER, Int(self.fd), n, min_complete, flags
         )
         if rc < 0:
             raise Error(

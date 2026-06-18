@@ -7,7 +7,9 @@ from socket.udp import UdpSocket
 from tests.helpers import check
 
 
-def run() raises:
+def run() raises -> Int:
+    var f = 0
+
     var listen_port = UInt16(19601)
     var server = UdpSocket.bind(
         SocketAddr(IpAddress.loopback_v4(), listen_port)
@@ -25,17 +27,22 @@ def run() raises:
     var got_pair = server.recv_from(2048)
     var pinged_len = len(got_pair[0])
     var client_addr = got_pair[1]
-    check(pinged_len == len(msg), "server received full ping")
+    f += check(pinged_len == len(msg), "server received full ping")
     _ = server.send_to(Span(got_pair[0]), client_addr)
 
     var reply_pair = client.recv_from(2048)
     var pong_len = len(reply_pair[0])
     var got = String(unsafe_from_utf8=Span(reply_pair[0]))
-    check(
-        got == String(unsafe_from_utf8=msg), "client got the echoed bytes back"
+    f += check(
+        got == String(unsafe_from_utf8=msg),
+        "client got the echoed bytes back",
     )
-    print("test_udp: OK (" + String(pong_len) + " bytes round-tripped)")
+    if f == 0:
+        print("test_udp: OK (" + String(pong_len) + " bytes round-tripped)")
+    return f
 
 
 def main() raises:
-    run()
+    var fails = run()
+    if fails > 0:
+        raise Error("test_udp: " + String(fails) + " failures")

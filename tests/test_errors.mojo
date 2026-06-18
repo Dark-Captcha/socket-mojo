@@ -25,63 +25,74 @@ def _expect_error(msg: String) raises -> Error:
     return Error(msg)
 
 
-def _test_predicates_via_message() raises:
+def _test_predicates_via_message() raises -> Int:
+    var f = 0
     var e1 = _expect_error(
         String("socket.tcp: connect() ECONNREFUSED (127.0.0.1:1)")
     )
-    check(is_connection_refused(e1), "predicate: ECONNREFUSED")
-    check(not is_timed_out(e1), "predicate: rejects unrelated tag")
-    check(
+    f += check(is_connection_refused(e1), "predicate: ECONNREFUSED")
+    f += check(not is_timed_out(e1), "predicate: rejects unrelated tag")
+    f += check(
         errno_of(e1) == Int32(ECONNREFUSED),
         "errno_of: ECONNREFUSED → 111",
     )
 
     var e2 = _expect_error(String("socket.tcp: send() EPIPE"))
-    check(is_broken_pipe(e2), "predicate: EPIPE")
+    f += check(is_broken_pipe(e2), "predicate: EPIPE")
 
     var e3 = _expect_error(String("socket.tcp: recv() ETIMEDOUT"))
-    check(is_timed_out(e3), "predicate: ETIMEDOUT")
+    f += check(is_timed_out(e3), "predicate: ETIMEDOUT")
 
     var e4 = _expect_error(String("socket.udp: connect() EHOSTUNREACH"))
-    check(is_host_unreachable(e4), "predicate: EHOSTUNREACH")
+    f += check(is_host_unreachable(e4), "predicate: EHOSTUNREACH")
 
     var e5 = _expect_error(
         String("socket.dns: server error rcode=3 for 'nx.test'")
     )
-    check(is_dns_error(e5), "predicate: DNS error")
-    check(errno_of(e5) == Int32(0), "errno_of: DNS error has no posix code")
+    f += check(is_dns_error(e5), "predicate: DNS error")
+    f += check(
+        errno_of(e5) == Int32(0), "errno_of: DNS error has no posix code"
+    )
 
     var e6 = _expect_error(String("socket.tcp: send() EBADF"))
-    check(is_bad_fd(e6), "predicate: EBADF")
+    f += check(is_bad_fd(e6), "predicate: EBADF")
 
     # Fallback path: `errno=N` for unnamed codes.
     var e7 = _expect_error(String("socket.foo: bar errno=84"))
-    check(errno_of(e7) == Int32(84), "errno_of: parses errno=N fallback")
+    f += check(errno_of(e7) == Int32(84), "errno_of: parses errno=N fallback")
+    return f
 
 
-def _test_predicates_against_real_failure() raises:
+def _test_predicates_against_real_failure() raises -> Int:
+    var f = 0
     # Connect to a port nothing is listening on; expect ECONNREFUSED.
     var caught = False
     try:
         var _sock = TcpSocket.connect("127.0.0.1", 1, timeout_seconds=1.0)
     except e:
         caught = True
-        check(
+        f += check(
             is_connection_refused(e),
             "live ECONNREFUSED detected via predicate",
         )
-        check(
+        f += check(
             errno_of(e) == Int32(ECONNREFUSED),
             "live ECONNREFUSED → 111",
         )
-    check(caught, "connecting to 127.0.0.1:1 must fail")
+    f += check(caught, "connecting to 127.0.0.1:1 must fail")
+    return f
 
 
-def run() raises:
-    _test_predicates_via_message()
-    _test_predicates_against_real_failure()
-    print("test_errors: OK")
+def run() raises -> Int:
+    var f = 0
+    f += _test_predicates_via_message()
+    f += _test_predicates_against_real_failure()
+    if f == 0:
+        print("test_errors: OK")
+    return f
 
 
 def main() raises:
-    run()
+    var fails = run()
+    if fails > 0:
+        raise Error("test_errors: " + String(fails) + " failures")

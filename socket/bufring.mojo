@@ -19,7 +19,7 @@ from socket._syscalls import (
     MAP_PRIVATE,
     PROT_READ,
     PROT_WRITE,
-    SYS_io_uring_register,
+    SYS_IO_URING_REGISTER,
     sys_mmap_or_raise,
     sys_munmap,
     syscall,
@@ -78,7 +78,7 @@ struct BufRing(Movable):
         (reg.unsafe_ptr() + 8).bitcast[UInt32]()[0] = UInt32(entries)
         (reg.unsafe_ptr() + 12).bitcast[UInt16]()[0] = bgid
         var rc = syscall(
-            SYS_io_uring_register,
+            SYS_IO_URING_REGISTER,
             Int(ring_fd),
             REGISTER_PBUF_RING,
             Int(reg.unsafe_ptr()),
@@ -94,7 +94,7 @@ struct BufRing(Movable):
         var reg = List[UInt8](length=40, fill=0)
         (reg.unsafe_ptr() + 12).bitcast[UInt16]()[0] = self.bgid
         _ = syscall(
-            SYS_io_uring_register,
+            SYS_IO_URING_REGISTER,
             Int(self.ring_fd),
             UNREGISTER_PBUF_RING,
             Int(reg.unsafe_ptr()),
