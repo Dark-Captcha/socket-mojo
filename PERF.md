@@ -77,6 +77,42 @@ pairs) to get a real network number. The structure of the
 benchmark is the right shape; the missing piece is the second
 box.
 
+## Cross-language comparison
+
+Same workload (64 conns × 1500 rounds × 64-byte payload), same
+machine, same kernel TCP loopback, separate server+client
+processes. Sources in `benchmarks/cross_lang/`; reproduce with
+`benchmarks/cross_lang/run.sh`.
+
+| Implementation                | rt/s     | Notes |
+|-------------------------------|---------:|-------|
+| Python asyncio (selector)     |   64 k/s | high-level scripting baseline |
+| Go `net` (GOMAXPROCS=1)       |  216 k/s | epoll + goroutines, 1 OS thread |
+| **socket-mojo Ring**          |  235 k/s | io_uring + multishot + pbuf, 1 thread |
+| **socket-mojo Ring + SQPOLL** |  **290 k/s** | + kernel SQ-poll kthread, 1 user thread |
+| C + liburing                  |  318 k/s | mature C bindings, same kernel features |
+| Go `net` (GOMAXPROCS=all)     |  472 k/s | 24 OS threads — multi-core advantage |
+
+**Honest reading:**
+
+- **Apples-to-apples (single thread)**, socket-mojo + SQPOLL is at
+  **91% of C/liburing** (the speed-of-light reference on this
+  kernel feature set) and **34% faster than Go-1cpu**.
+- Without SQPOLL, socket-mojo is still **9% ahead of Go-1cpu**.
+- **Python is 4–5× slower**: interpreter + per-call allocation
+  overhead dwarfs the I/O path.
+- **Go-all-cores wins** because the Go runtime spreads goroutines
+  across all 24 logical CPUs by default. socket-mojo's single
+  Ring is single-threaded by design; to match multi-core scaling
+  the recipe is `SO_REUSEPORT` + multiple worker processes (see
+  `README.md` and the `Ring.msg_ring()` primitive for cross-ring
+  signalling).
+- The **C/liburing gap (~10%)** is mostly safety overhead — Mojo's
+  Ring tracks op-slot lifetimes, generation counters, and buffer
+  ownership; the C code recycles buffers immediately and trusts
+  the kernel ordering. Worth that gap for "no use-after-free on
+  the kernel send path."
+
 Per-connection rate stays flat across 8 → 256 conns: one ring
 drives 256 simultaneous echo flows with no measurable degradation,
 where the same workload on epoll would require explicit edge-
