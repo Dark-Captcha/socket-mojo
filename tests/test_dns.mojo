@@ -2,7 +2,7 @@
 # hosts on Linux) and verify we get at least one IPv4 or IPv6 loopback
 # answer. We also verify the literal-IP fast path.
 
-from socket.addr import IpAddress
+from socket.addr import AddressFamily, Ipv4Address, SocketAddr
 from socket.dns import resolve
 from tests.helpers import check
 
@@ -14,14 +14,16 @@ def run() raises -> Int:
     var lit_v4 = resolve("127.0.0.1")
     f += check(len(lit_v4) == 1, "literal v4 returns one answer")
     f += check(
-        lit_v4[0] == IpAddress.loopback_v4(), "literal v4 matches loopback"
+        lit_v4[0] == SocketAddr.v4(Ipv4Address.loopback(), 0),
+        "literal v4 matches loopback",
     )
 
     # Literal IPv6
     var lit_v6 = resolve("::1")
     f += check(len(lit_v6) == 1, "literal v6 returns one answer")
     f += check(
-        lit_v6[0].is_v6 and lit_v6[0].is_loopback(), "literal v6 is loopback"
+        lit_v6[0].kind() == AddressFamily.V6 and lit_v6[0].is_loopback(),
+        "literal v6 is loopback",
     )
 
     # Real DNS: localhost should always resolve to a loopback address.

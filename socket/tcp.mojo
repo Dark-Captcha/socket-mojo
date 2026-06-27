@@ -36,7 +36,6 @@ from socket._syscalls import (
     SO_SNDTIMEO,
     TCP_NODELAY,
     errno_message,
-    read_sockaddr,
     sys_accept4,
     sys_bind,
     sys_close,
@@ -49,9 +48,13 @@ from socket._syscalls import (
     sys_shutdown,
     sys_socket,
     sys_writev,
+)
+from socket.addr import (
+    AddressFamily,
+    SocketAddr,
+    read_sockaddr,
     write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
 from socket.dns import resolve
 
 
@@ -65,21 +68,21 @@ struct TcpSocket(Movable):
     """Owned TCP file descriptor. Closes on destruction unless taken."""
 
     var fd: Int32
-    var is_v6: Bool
+    var family: AddressFamily
 
-    def __init__(out self, fd: Int32, is_v6: Bool):
+    def __init__(out self, fd: Int32, family: AddressFamily):
         self.fd = fd
-        self.is_v6 = is_v6
+        self.family = family
 
     def __del__(deinit self):
         if self.fd >= 0:
             _ = sys_close(self.fd)
 
     @staticmethod
-    def from_fd(fd: Int32, is_v6: Bool) -> TcpSocket:
+    def from_fd(fd: Int32, family: AddressFamily) -> TcpSocket:
         """Wrap an already-open file descriptor (e.g. one returned by
         accept). Takes ownership: the socket will close fd on drop."""
-        return TcpSocket(fd, is_v6)
+        return TcpSocket(fd, family)
 
     @staticmethod
     def connect(
@@ -99,7 +102,7 @@ struct TcpSocket(Movable):
 
     @staticmethod
     def connect_to_addrs(
-        addrs: List[IpAddress],
+        addrs: List[SocketAddr],
         port: UInt16,
         *,
         timeout_seconds: Float64 = 30.0,
@@ -108,6 +111,8 @@ struct TcpSocket(Movable):
         `resolve()` call — useful when paired with a DNS cache that hands you
         a fresh address list per call without re-hitting the resolver.
 
+        Each `SocketAddr` carries only the IP (DNS results have no port); the
+        `port` argument is stamped onto whichever candidate is dialed.
         Behaviour is otherwise identical to `connect()`: IPv4-first ordering,
         try each address in turn, return the first successful socket. Raises
         if `addrs` is empty or every candidate fails."""
@@ -115,29 +120,26 @@ struct TcpSocket(Movable):
             _raise("socket.tcp: EAI_NONAME empty address list")
         # Prefer IPv4 first: many hosts (and CI/sandbox environments) lack a
         # usable IPv6 route, so try reachable A records before AAAA.
-        var ordered = List[IpAddress]()
+        var ordered = List[SocketAddr]()
         for i in range(len(addrs)):
-            if not addrs[i].is_v6:
+            if addrs[i].kind() == AddressFamily.V4:
                 ordered.append(addrs[i])
         for i in range(len(addrs)):
-            if addrs[i].is_v6:
+            if addrs[i].kind() == AddressFamily.V6:
                 ordered.append(addrs[i])
         var last_err = String("socket.tcp: connect failed")
         for ip_index in range(len(ordered)):
-            var ip = ordered[ip_index]
-            var family = AF_INET6 if ip.is_v6 else AF_INET
+            var target = ordered[ip_index].with_port(port)
+            var family = (
+                AF_INET6 if target.kind() == AddressFamily.V6 else AF_INET
+            )
             var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
             if rc < 0:
                 last_err = "socket.tcp: socket(2) " + errno_message(Int32(-rc))
                 continue
             var fd = Int32(rc)
             var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-            var alen = write_sockaddr(
-                sa.unsafe_ptr(),
-                ip.is_v6,
-                ip.octets,
-                port,
-            )
+            var alen = write_sockaddr(sa.unsafe_ptr(), target)
             # The kernel-default connect timeout can be many minutes;
             # we set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the
             # syscall itself respects the deadline.
@@ -152,14 +154,12 @@ struct TcpSocket(Movable):
                 if rv != -4:  # not EINTR
                     break
             if rv == 0:
-                return TcpSocket(fd, ip.is_v6)
+                return TcpSocket(fd, target.kind())
             last_err = (
                 "socket.tcp: connect() "
                 + errno_message(Int32(-rv))
                 + " ("
-                + ip.to_string()
-                + ":"
-                + String(Int(port))
+                + target.to_string()
                 + ")"
             )
             _ = sys_close(fd)
@@ -381,11 +381,11 @@ struct TcpListener(Movable):
     """TCP server endpoint."""
 
     var fd: Int32
-    var is_v6: Bool
+    var family: AddressFamily
 
-    def __init__(out self, fd: Int32, is_v6: Bool):
+    def __init__(out self, fd: Int32, family: AddressFamily):
         self.fd = fd
-        self.is_v6 = is_v6
+        self.family = family
 
     def __del__(deinit self):
         if self.fd >= 0:
@@ -405,7 +405,7 @@ struct TcpListener(Movable):
         connections — the standard recipe for thread-per-core / one-
         Ring-per-CPU scaling without crossing process boundaries on
         the data path."""
-        var family = AF_INET6 if addr.ip.is_v6 else AF_INET
+        var family = AF_INET6 if addr.kind() == AddressFamily.V6 else AF_INET
         var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
         if rc < 0:
             _raise("socket.tcp: socket(2)", Int32(-rc))
@@ -427,12 +427,7 @@ struct TcpListener(Movable):
                 4,
             )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-        var alen = write_sockaddr(
-            sa.unsafe_ptr(),
-            addr.ip.is_v6,
-            addr.ip.octets,
-            addr.port,
-        )
+        var alen = write_sockaddr(sa.unsafe_ptr(), addr)
         var rv = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
             _ = sys_close(fd)
@@ -441,7 +436,7 @@ struct TcpListener(Movable):
         if rv != 0:
             _ = sys_close(fd)
             _raise("socket.tcp: listen(2)", Int32(-rv))
-        return TcpListener(fd, addr.ip.is_v6)
+        return TcpListener(fd, addr.kind())
 
     def accept(mut self) raises -> Tuple[TcpSocket, SocketAddr]:
         """Block until an inbound connection arrives; return the peer
@@ -462,14 +457,8 @@ struct TcpListener(Movable):
             if rc == -4:  # EINTR: retry transparently
                 continue
             _raise("socket.tcp: accept(2)", Int32(-rc))
-        var is_v6: Bool
-        var octets: InlineArray[UInt8, 16]
-        var port: UInt16
-        is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
-        return (
-            TcpSocket(Int32(rc), is_v6),
-            SocketAddr(IpAddress(is_v6, octets), port),
-        )
+        var peer = read_sockaddr(sa.unsafe_ptr())
+        return (TcpSocket(Int32(rc), peer.kind()), peer)
 
     def local_addr(self) raises -> SocketAddr:
         """The address this listener is bound to (resolves the
@@ -481,11 +470,7 @@ struct TcpListener(Movable):
         )
         if rv != 0:
             _raise("socket.tcp: getsockname(2)", Int32(-rv))
-        var is_v6: Bool
-        var octets: InlineArray[UInt8, 16]
-        var port: UInt16
-        is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
-        return SocketAddr(IpAddress(is_v6, octets), port)
+        return read_sockaddr(sa.unsafe_ptr())
 
 
 def _apply_timeout(fd: Int32, seconds: Float64):

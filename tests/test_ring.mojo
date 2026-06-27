@@ -20,9 +20,8 @@ from socket._syscalls import (
     sys_listen,
     sys_setsockopt,
     sys_socket,
-    write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import Ipv4Address, SocketAddr, write_sockaddr
 from socket.ring import Completion, CompletionKind, Ring
 from std.memory import UnsafePointer
 
@@ -50,8 +49,8 @@ def _listening_socket(port: UInt16) raises -> Int32:
         4,
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-    var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var ip = Ipv4Address(127, 0, 0, 1)
+    var alen = write_sockaddr(sa.unsafe_ptr(), SocketAddr.v4(ip, port))
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring: bind() " + errno_message(Int32(-brc)))
@@ -91,7 +90,7 @@ def _test_loopback_echo() raises -> Int:
     var lfd = _listening_socket(port)
     var cfd = _client_sock()
 
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var accept_op = ring.accept(lfd)
     var connect_op = ring.connect(cfd, dest)
     _ = ring.wait(min_complete=2)
@@ -107,7 +106,7 @@ def _test_loopback_echo() raises -> Int:
             afd = done.res
             var peer = done.accepted_peer()
             f += check(
-                peer.ip.is_loopback() and peer.port != 0,
+                peer.is_loopback() and peer.port != 0,
                 "ring: accepted peer is loopback with a real port",
             )
         else:
@@ -177,7 +176,7 @@ def _test_external_echo() raises -> Int:
     # convention as test_tcp.mojo, dedicated port).
     var ring = Ring(32)
     var cfd = _client_sock()
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), UInt16(19503))
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), UInt16(19503))
     _ = ring.connect(cfd, dest)
     _ = ring.wait(min_complete=1)
     var c0 = ring.next_completion()
@@ -224,7 +223,7 @@ def _test_multishot_and_buffers() raises -> Int:
     var ms_accept = ring.accept_multishot(lfd)
     _ = ring.submit()
 
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var clients = List[Int32]()
     for _ in range(3):
         var cfd = _client_sock()
@@ -333,7 +332,7 @@ def _test_timers() raises -> Int:
     var port = UInt16(19614)
     var lfd = _listening_socket(port)
     var cfd = _client_sock()
-    _ = ring.connect(cfd, SocketAddr(IpAddress.v4(127, 0, 0, 1), port))
+    _ = ring.connect(cfd, SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port))
     var acc = ring.accept(lfd)
     _ = ring.wait(min_complete=2)
     var afd = Int32(-1)

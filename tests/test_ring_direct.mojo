@@ -26,9 +26,8 @@ from socket._syscalls import (
     sys_listen,
     sys_setsockopt,
     sys_socket,
-    write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import Ipv4Address, SocketAddr, write_sockaddr
 from socket.ring import CompletionKind, Ring
 from tests.helpers import check
 
@@ -54,8 +53,8 @@ def _listening_socket(port: UInt16) raises -> Int32:
         4,
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-    var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var ip = Ipv4Address(127, 0, 0, 1)
+    var alen = write_sockaddr(sa.unsafe_ptr(), SocketAddr.v4(ip, port))
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring_direct: bind " + errno_message(Int32(-brc)))
@@ -83,7 +82,7 @@ def _test_accept_direct_echo() raises -> Int:
     var lfd = _listening_socket(port)
     var cfd = _client_sock()
 
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var accept_op = ring.accept_direct(lfd)
     # Connect using a raw fd (the standard, non-direct connect).
     var connect_op = ring.connect(cfd, dest)
@@ -102,7 +101,7 @@ def _test_accept_direct_echo() raises -> Int:
             direct_slot = done.res
             var peer = done.accepted_peer()
             f += check(
-                peer.ip.is_loopback() and peer.port != 0,
+                peer.is_loopback() and peer.port != 0,
                 "direct: peer addr is loopback with a real port",
             )
             saw_accept = True
@@ -178,7 +177,7 @@ def _test_accept_multishot_direct() raises -> Int:
     var ms_accept = ring.accept_multishot_direct(lfd)
     _ = ring.submit()
 
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var clients = List[Int32]()
     for _ in range(3):
         var cfd = _client_sock()
@@ -241,7 +240,7 @@ def _test_socket_direct_connect_and_io() raises -> Int:
     ring.register_files(8)
     var port = UInt16(19622)
     var lfd = _listening_socket(port)
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var accept_op = ring.accept(lfd)
     var sock_op = ring.socket_direct(Int(AF_INET), Int(SOCK_STREAM), 0)
     _ = ring.wait(min_complete=1)  # OP_SOCKET completes immediately
@@ -310,7 +309,7 @@ def _test_send_zc() raises -> Int:
     var port = UInt16(19623)
     var lfd = _listening_socket(port)
     var cfd = _client_sock()
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     var accept_op = ring.accept(lfd)
     _ = ring.connect(cfd, dest)
     _ = ring.wait(min_complete=2)

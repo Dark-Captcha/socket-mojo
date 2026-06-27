@@ -3,7 +3,7 @@
 # echo round trip. The shell helper runs *before* this Mojo program
 # starts the server, so the test is portable: any Python 3 in $PATH.
 
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import Ipv4Address, SocketAddr
 from socket.tcp import TcpSocket
 from tests.helpers import check
 
@@ -25,22 +25,18 @@ def run() raises -> Int:
 
     # connect_to_addrs: pre-resolved entry point used by DNS-caching callers.
     # Build a one-element address list and verify the same echo round trip.
-    var addrs = List[IpAddress]()
-    addrs.append(IpAddress.loopback_v4())
-    var sock2 = TcpSocket.connect_to_addrs(
-        addrs, port, timeout_seconds=2.0
-    )
+    var addrs = List[SocketAddr]()
+    addrs.append(SocketAddr.v4(Ipv4Address.loopback(), 0))
+    var sock2 = TcpSocket.connect_to_addrs(addrs, port, timeout_seconds=2.0)
     sock2.write(msg.as_bytes())
     var got2_bytes = sock2.read_exact(msg.byte_length())
     var got2 = String(unsafe_from_utf8=got2_bytes)
-    f += check(
-        got2 == msg, "connect_to_addrs echo round trip: " + got2
-    )
+    f += check(got2 == msg, "connect_to_addrs echo round trip: " + got2)
 
     # connect_to_addrs raises on an empty address list (EAI_NONAME shape).
     var raised_empty = False
     try:
-        var addrs_empty = List[IpAddress]()
+        var addrs_empty = List[SocketAddr]()
         var _ = TcpSocket.connect_to_addrs(
             addrs_empty, port, timeout_seconds=2.0
         )

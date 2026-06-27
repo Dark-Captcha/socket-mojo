@@ -18,7 +18,6 @@ from socket._syscalls import (
     SO_REUSEADDR,
     SO_SNDTIMEO,
     errno_message,
-    read_sockaddr,
     sys_bind,
     sys_close,
     sys_connect,
@@ -26,20 +25,24 @@ from socket._syscalls import (
     sys_sendto,
     sys_setsockopt,
     sys_socket,
+)
+from socket.addr import (
+    AddressFamily,
+    SocketAddr,
+    read_sockaddr,
     write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
 
 
 struct UdpSocket(Movable):
     """Owned UDP file descriptor."""
 
     var fd: Int32
-    var is_v6: Bool
+    var family: AddressFamily
 
-    def __init__(out self, fd: Int32, is_v6: Bool):
+    def __init__(out self, fd: Int32, family: AddressFamily):
         self.fd = fd
-        self.is_v6 = is_v6
+        self.family = family
 
     def __del__(deinit self):
         if self.fd >= 0:
@@ -49,7 +52,7 @@ struct UdpSocket(Movable):
     def bind(addr: SocketAddr) raises -> UdpSocket:
         """Bind to a local address. Use port 0 to let the kernel pick.
         SO_REUSEADDR is enabled (idempotent in UDP)."""
-        var family = AF_INET6 if addr.ip.is_v6 else AF_INET
+        var family = AF_INET6 if addr.kind() == AddressFamily.V6 else AF_INET
         var rc = sys_socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0)
         if rc < 0:
             raise Error("socket.udp: socket(2) " + errno_message(Int32(-rc)))
@@ -63,17 +66,12 @@ struct UdpSocket(Movable):
             4,
         )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-        var alen = write_sockaddr(
-            sa.unsafe_ptr(),
-            addr.ip.is_v6,
-            addr.ip.octets,
-            addr.port,
-        )
+        var alen = write_sockaddr(sa.unsafe_ptr(), addr)
         var rv = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
         if rv != 0:
             _ = sys_close(fd)
             raise Error("socket.udp: bind(2) " + errno_message(Int32(-rv)))
-        return UdpSocket(fd, addr.ip.is_v6)
+        return UdpSocket(fd, addr.kind())
 
     @staticmethod
     def open(*, ipv6: Bool = False) raises -> UdpSocket:
@@ -83,7 +81,9 @@ struct UdpSocket(Movable):
         var rc = sys_socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0)
         if rc < 0:
             raise Error("socket.udp: socket(2) " + errno_message(Int32(-rc)))
-        return UdpSocket(Int32(rc), ipv6)
+        return UdpSocket(
+            Int32(rc), AddressFamily.V6 if ipv6 else AddressFamily.V4
+        )
 
     def connect_peer(mut self, peer: SocketAddr) raises:
         """Connect a UDP socket to a fixed peer. After this, the
@@ -91,12 +91,7 @@ struct UdpSocket(Movable):
         use plain send/recv if you prefer (we still expose
         send_to/recv_from for symmetry)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-        var alen = write_sockaddr(
-            sa.unsafe_ptr(),
-            peer.ip.is_v6,
-            peer.ip.octets,
-            peer.port,
-        )
+        var alen = write_sockaddr(sa.unsafe_ptr(), peer)
         var rv: Int
         while True:
             rv = sys_connect(self.fd, sa.unsafe_ptr(), Int(alen))
@@ -110,12 +105,7 @@ struct UdpSocket(Movable):
         accepted (almost always == len(data); UDP doesn't fragment in
         userland)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-        var alen = write_sockaddr(
-            sa.unsafe_ptr(),
-            peer.ip.is_v6,
-            peer.ip.octets,
-            peer.port,
-        )
+        var alen = write_sockaddr(sa.unsafe_ptr(), peer)
         var n: Int
         while True:
             n = sys_sendto(
@@ -161,11 +151,7 @@ struct UdpSocket(Movable):
                 continue
             raise Error("socket.udp: recvfrom(2) " + errno_message(Int32(-n)))
         buf.resize(unsafe_uninit_length=n)
-        var is_v6: Bool
-        var octets: InlineArray[UInt8, 16]
-        var port: UInt16
-        is_v6, octets, port = read_sockaddr(sa.unsafe_ptr())
-        return (buf^, SocketAddr(IpAddress(is_v6, octets), port))
+        return (buf^, read_sockaddr(sa.unsafe_ptr()))
 
     def set_read_timeout(mut self, seconds: Float64) raises:
         _set_one_timeout(self.fd, SO_RCVTIMEO, seconds)

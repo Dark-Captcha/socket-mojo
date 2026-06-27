@@ -31,11 +31,9 @@ from socket._syscalls import (
     SOCKADDR_STORAGE_SIZE,
     SYS_IO_URING_REGISTER,
     errno_message,
-    read_sockaddr,
     syscall,
-    write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import SocketAddr, read_sockaddr, write_sockaddr
 from socket.bufring import BufRing
 from socket.uring_sys import (
     ACCEPT_MULTISHOT,
@@ -257,9 +255,7 @@ struct Completion(Movable):
         )
         if not ok or len(self.buf) < SOCKADDR_STORAGE_SIZE:
             raise Error("socket.ring: not an accept completion")
-        var parsed = read_sockaddr(self.buf.unsafe_ptr())
-        var ip = IpAddress(parsed[0], parsed[1])
-        return SocketAddr(ip, parsed[2])
+        return read_sockaddr(self.buf.unsafe_ptr())
 
 
 struct Ring(Movable):
@@ -513,12 +509,7 @@ struct Ring(Movable):
         # so we allocate uninitialized.
         var st = List[UInt8](capacity=SOCKADDR_STORAGE_SIZE)
         st.resize(unsafe_uninit_length=SOCKADDR_STORAGE_SIZE)
-        var alen = write_sockaddr(
-            st.unsafe_ptr(),
-            addr.ip.is_v6,
-            addr.ip.octets,
-            addr.port,
-        )
+        var alen = write_sockaddr(st.unsafe_ptr(), addr)
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
         var idx = self._alloc(CompletionKind.CONNECT, fd, st^)
         var ud = self._user_data(idx, CompletionKind.CONNECT)

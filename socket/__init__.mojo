@@ -10,7 +10,8 @@
 # Layers (Linux-first; portable to Windows IOCP later via the same
 # completion-shaped API on a Windows backend):
 #
-#   socket/addr.mojo      pure value types (IpAddress, SocketAddr)
+#   socket/addr/          pure value types (Ipv4Address, Ipv6Address,
+#                         AddressFamily, SocketAddr) — v4/v6 split by type
 #   socket/dnswire.mojo   sans-io RFC 1035 codec
 #   socket/dns.mojo       /etc/hosts + /etc/resolv.conf + DNS via Ring
 #   socket/tcp.mojo       blocking TcpSocket / TcpListener
@@ -24,11 +25,15 @@
 
 # --- value types ---------------------------------------------------
 from socket.addr import (
-    IpAddress,
+    AddressFamily,
+    Ipv4Address,
+    Ipv6Address,
     SocketAddr,
     parse_ip,
     parse_ipv4,
     parse_ipv6,
+    read_sockaddr,
+    write_sockaddr,
 )
 
 # --- blocking sockets ---------------------------------------------

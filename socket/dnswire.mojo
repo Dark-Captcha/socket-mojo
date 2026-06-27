@@ -10,7 +10,7 @@
 # potentially attacker-injected records), and surfaces the TC bit so
 # the transport can retry over TCP.
 
-from socket.addr import IpAddress
+from socket.addr import Ipv4Address, Ipv6Address, SocketAddr
 
 comptime QTYPE_A = UInt16(1)
 comptime QTYPE_CNAME = UInt16(5)
@@ -26,14 +26,16 @@ comptime _MAX_ANSWERS = 256
 
 
 struct DnsAnswer(Copyable, Movable):
-    """Parsed answer section of one response."""
+    """Parsed answer section of one response. Addresses are carried as
+    `SocketAddr` (port 0) — the family-discriminated sum is the only type
+    that can hold a mixed A (v4) + AAAA (v6) record set in one list."""
 
-    var addresses: List[IpAddress]
+    var addresses: List[SocketAddr]
     var truncated: Bool  # TC bit: retry the query over TCP
     var rcode: UInt8
 
     def __init__(out self):
-        self.addresses = List[IpAddress]()
+        self.addresses = List[SocketAddr]()
         self.truncated = False
         self.rcode = 0
 
@@ -196,14 +198,17 @@ def dns_parse_response(
                 current = t[0]
             elif rtype == qtype and qtype == QTYPE_A and rdlen == 4:
                 out.addresses.append(
-                    IpAddress.v4(
-                        msg[off], msg[off + 1], msg[off + 2], msg[off + 3]
+                    SocketAddr.v4(
+                        Ipv4Address(
+                            msg[off], msg[off + 1], msg[off + 2], msg[off + 3]
+                        ),
+                        0,
                     )
                 )
             elif rtype == qtype and qtype == QTYPE_AAAA and rdlen == 16:
                 var oct = InlineArray[UInt8, 16](fill=0)
                 for i in range(16):
                     oct[i] = msg[off + i]
-                out.addresses.append(IpAddress(True, oct))
+                out.addresses.append(SocketAddr.v6(Ipv6Address(oct), 0))
         off += rdlen
     return out^

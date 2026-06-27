@@ -28,9 +28,14 @@ from socket._syscalls import (
     sys_openat,
     sys_read,
     sys_socket,
+)
+from socket.addr import (
+    AddressFamily,
+    Ipv4Address,
+    SocketAddr,
+    parse_ip,
     write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr, parse_ip
 from socket.dnswire import (
     DnsAnswer,
     QTYPE_A,
@@ -130,11 +135,11 @@ def _tokenize_line(line: Span[UInt8, _]) -> List[Int]:
 # --- /etc/hosts ------------------------------------------------------
 
 
-def _lookup_hosts(host: String) -> List[IpAddress]:
-    """Walk /etc/hosts looking for `host`. Returns matching IPs in
-    file order; empty if the file is missing or no match. ASCII
+def _lookup_hosts(host: String) -> List[SocketAddr]:
+    """Walk /etc/hosts looking for `host`. Returns matching IPs (port 0)
+    in file order; empty if the file is missing or no match. ASCII
     case-insensitive."""
-    var out = List[IpAddress]()
+    var out = List[SocketAddr]()
     var text: List[UInt8]
     try:
         text = _read_file_bytes(String("/etc/hosts"))
@@ -159,14 +164,14 @@ def _hosts_match_line(
     line_start: Int,
     line_end: Int,
     host_bytes: Span[UInt8, _],
-    mut out: List[IpAddress],
+    mut out: List[SocketAddr],
 ):
     var line = span[line_start:line_end]
     var toks = _tokenize_line(line)
     if len(toks) < 4:  # need at least IP + one name
         return
     var ip_str = _slice_to_str(line, toks[0], toks[1])
-    var ip: IpAddress
+    var ip: SocketAddr
     try:
         ip = parse_ip(ip_str)
     except:
@@ -221,8 +226,8 @@ def _resolv_collect_line(
         return
     var ip_str = _slice_to_str(line, toks[2], toks[3])
     try:
-        var ip = parse_ip(ip_str)
-        out.append(SocketAddr(ip, 53))
+        var addr = parse_ip(ip_str)
+        out.append(addr.with_port(53))
     except:
         pass
 
@@ -242,18 +247,13 @@ def _random_txid() raises -> UInt16:
 def _connected_socket(server: SocketAddr, socktype: Int) raises -> Int32:
     """Open a fresh fd connected to `server`. The fd is OWNED by the
     caller (the Ring only owns its io_uring fd)."""
-    var family = AF_INET6 if server.ip.is_v6 else AF_INET
+    var family = AF_INET6 if server.kind() == AddressFamily.V6 else AF_INET
     var rc = sys_socket(family, socktype | SOCK_CLOEXEC, 0)
     if rc < 0:
         raise Error("socket.dns: socket() " + errno_message(Int32(-rc)))
     var fd = Int32(rc)
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-    var alen = write_sockaddr(
-        sa.unsafe_ptr(),
-        server.ip.is_v6,
-        server.ip.octets,
-        server.port,
-    )
+    var alen = write_sockaddr(sa.unsafe_ptr(), server)
     var crc: Int
     while True:
         crc = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
@@ -394,13 +394,14 @@ def resolve_dns(
     qtype: UInt16 = QTYPE_A,
     timeout_ms: Int = 2000,
     retries: Int = 2,
-) raises -> List[IpAddress]:
+) raises -> List[SocketAddr]:
     """Query `server` directly for `host` of `qtype` (A or AAAA).
     UDP with per-attempt deadline and fresh transaction ids; TCP
-    fallback on truncation. NXDOMAIN and other server errors raise."""
+    fallback on truncation. NXDOMAIN and other server errors raise.
+    Addresses come back as `SocketAddr` (port 0)."""
     try:
         var literal = parse_ip(host)
-        var out = List[IpAddress]()
+        var out = List[SocketAddr]()
         out.append(literal)
         return out^
     except:
@@ -426,14 +427,14 @@ def resolve_dns(
 # --- public entry point ----------------------------------------------
 
 
-def resolve(host: String) raises -> List[IpAddress]:
-    """Resolve `host` to a list of IP addresses (A records first,
-    then AAAA). The full lookup chain: literal-IP fast path →
-    /etc/hosts override → DNS query against each `nameserver` in
-    /etc/resolv.conf. No glibc resolver, no getaddrinfo, no nss."""
+def resolve(host: String) raises -> List[SocketAddr]:
+    """Resolve `host` to a list of addresses (A records first, then
+    AAAA), each a port-0 `SocketAddr`. The full lookup chain: literal-IP
+    fast path → /etc/hosts override → DNS query against each `nameserver`
+    in /etc/resolv.conf. No glibc resolver, no getaddrinfo, no nss."""
     try:
         var literal = parse_ip(host)
-        var out = List[IpAddress]()
+        var out = List[SocketAddr]()
         out.append(literal)
         return out^
     except:
@@ -446,10 +447,10 @@ def resolve(host: String) raises -> List[IpAddress]:
         # No /etc/resolv.conf and no /etc/hosts hit — assume a local
         # resolver on loopback (systemd-resolved binds 127.0.0.53,
         # but the conventional fallback is 127.0.0.1:53).
-        nameservers.append(SocketAddr(IpAddress.v4(127, 0, 0, 1), 53))
+        nameservers.append(SocketAddr.v4(Ipv4Address(127, 0, 0, 1), 53))
     var got_answer = False
     var rcode: UInt8 = 0
-    var addrs = List[IpAddress]()
+    var addrs = List[SocketAddr]()
     for ni in range(len(nameservers)):
         var ns = nameservers[ni]
         var ans_a: DnsAnswer

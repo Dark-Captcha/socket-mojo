@@ -26,9 +26,8 @@ from socket._syscalls import (
     sys_listen,
     sys_setsockopt,
     sys_socket,
-    write_sockaddr,
 )
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import Ipv4Address, SocketAddr, write_sockaddr
 from socket.ring import CompletionKind, Ring
 
 
@@ -50,8 +49,8 @@ def _listen_on(port: UInt16) raises -> Int32:
         4,
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
-    var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
+    var ip = Ipv4Address(127, 0, 0, 1)
+    var alen = write_sockaddr(sa.unsafe_ptr(), SocketAddr.v4(ip, port))
     if sys_bind(lfd, sa.unsafe_ptr(), Int(alen)) != 0:
         raise Error("soak: bind")
     if sys_listen(lfd, 8) != 0:
@@ -112,7 +111,7 @@ def _soak_echo() raises:
 
     # Set up one connection.
     var cfd = _fresh_socket()
-    var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
+    var dest = SocketAddr.v4(Ipv4Address(127, 0, 0, 1), port)
     _ = ring.accept(lfd)
     _ = ring.connect(cfd, dest)
     _ = ring.wait(min_complete=2)

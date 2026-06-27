@@ -444,64 +444,7 @@ def errno_message(code: Int32) -> String:
     return "errno=" + String(Int(code))
 
 
-# --- sockaddr layout helpers ------------------------------------------
-
-
-def write_sockaddr[
-    O: Origin[mut=True]
-](
-    out_buf: UnsafePointer[UInt8, O],
-    ip_is_v6: Bool,
-    octets: InlineArray[UInt8, 16],
-    port: UInt16,
-) -> UInt32:
-    """Serialise an (ip, port) into the kernel's `sockaddr_in[6]`
-    layout. Returns the byte length the kernel expects (16 or 28)."""
-    for i in range(SOCKADDR_STORAGE_SIZE):
-        out_buf[i] = 0
-    if not ip_is_v6:
-        # struct sockaddr_in:
-        #   [0..2]   sin_family (host order; LE on x86 → 0x02 0x00)
-        #   [2..4]   sin_port   (network = big-endian)
-        #   [4..8]   sin_addr   (network)
-        #   [8..16]  zero padding
-        out_buf[0] = UInt8(AF_INET)
-        out_buf[1] = 0
-        out_buf[2] = UInt8((port >> 8) & 0xFF)
-        out_buf[3] = UInt8(port & 0xFF)
-        out_buf[4] = octets[0]
-        out_buf[5] = octets[1]
-        out_buf[6] = octets[2]
-        out_buf[7] = octets[3]
-        return 16
-    # struct sockaddr_in6:
-    #   [0..2]   sin6_family
-    #   [2..4]   sin6_port      (BE)
-    #   [4..8]   sin6_flowinfo
-    #   [8..24]  sin6_addr      (16 B, network)
-    #   [24..28] sin6_scope_id
-    out_buf[0] = UInt8(AF_INET6)
-    out_buf[1] = 0
-    out_buf[2] = UInt8((port >> 8) & 0xFF)
-    out_buf[3] = UInt8(port & 0xFF)
-    for i in range(16):
-        out_buf[8 + i] = octets[i]
-    return 28
-
-
-def read_sockaddr(
-    buf: UnsafePointer[UInt8, _],
-) -> Tuple[Bool, InlineArray[UInt8, 16], UInt16]:
-    """Inverse of write_sockaddr."""
-    var family = buf[0]
-    var port = (UInt16(buf[2]) << 8) | UInt16(buf[3])
-    var octets = InlineArray[UInt8, 16](fill=0)
-    if family == UInt8(AF_INET6):
-        for i in range(16):
-            octets[i] = buf[8 + i]
-        return (True, octets, port)
-    octets[0] = buf[4]
-    octets[1] = buf[5]
-    octets[2] = buf[6]
-    octets[3] = buf[7]
-    return (False, octets, port)
+# sockaddr serialization (write_sockaddr / read_sockaddr) lives in
+# socket/addr/socket_addr.mojo — it dispatches on the SocketAddr family,
+# and keeping it there leaves this low-level syscall module free of any
+# dependency on the address value types (no import cycle).

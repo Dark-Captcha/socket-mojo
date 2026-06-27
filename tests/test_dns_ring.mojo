@@ -6,7 +6,7 @@
 # path, NXDOMAIN as a raised error, and the pure parser's rejection
 # of malformed/mismatched packets.
 
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import AddressFamily, Ipv4Address, SocketAddr
 from socket.dns import resolve_dns
 from socket.dnswire import (
     QTYPE_A,
@@ -19,7 +19,7 @@ from tests.helpers import check
 
 
 def _server() -> SocketAddr:
-    return SocketAddr(IpAddress.v4(127, 0, 0, 1), UInt16(19553))
+    return SocketAddr.v4(Ipv4Address(127, 0, 0, 1), UInt16(19553))
 
 
 def _test_resolver() raises -> Int:
@@ -28,31 +28,36 @@ def _test_resolver() raises -> Int:
     var a = resolve_dns("a.test", server=_server())
     f += check(len(a) == 2, "dns: a.test record count")
     f += check(
-        a[0] == IpAddress.v4(1, 2, 3, 4) and a[1] == IpAddress.v4(5, 6, 7, 8),
+        a[0] == SocketAddr.v4(Ipv4Address(1, 2, 3, 4), 0)
+        and a[1] == SocketAddr.v4(Ipv4Address(5, 6, 7, 8), 0),
         "dns: a.test addresses",
     )
 
     # AAAA
     var aaaa = resolve_dns("aaaa.test", server=_server(), qtype=QTYPE_AAAA)
-    f += check(len(aaaa) == 1 and aaaa[0].is_v6, "dns: aaaa.test v6 answer")
     f += check(
-        aaaa[0].octets[0] == 0x20
-        and aaaa[0].octets[1] == 0x01
-        and aaaa[0].octets[15] == 0x42,
+        len(aaaa) == 1 and aaaa[0].kind() == AddressFamily.V6,
+        "dns: aaaa.test v6 answer",
+    )
+    var aaaa6 = aaaa[0].as_v6()
+    f += check(
+        aaaa6.octets[0] == 0x20
+        and aaaa6.octets[1] == 0x01
+        and aaaa6.octets[15] == 0x42,
         "dns: aaaa.test bytes",
     )
 
     # CNAME chain with compression pointers
     var cn = resolve_dns("cname.test", server=_server())
     f += check(
-        len(cn) == 1 and cn[0] == IpAddress.v4(1, 2, 3, 4),
+        len(cn) == 1 and cn[0] == SocketAddr.v4(Ipv4Address(1, 2, 3, 4), 0),
         "dns: cname chain followed",
     )
 
     # TC over UDP -> full answer over TCP
     var big = resolve_dns("big.test", server=_server())
     f += check(
-        len(big) == 1 and big[0] == IpAddress.v4(9, 9, 9, 9),
+        len(big) == 1 and big[0] == SocketAddr.v4(Ipv4Address(9, 9, 9, 9), 0),
         "dns: tcp fallback on truncation",
     )
 
@@ -73,7 +78,8 @@ def _test_resolver() raises -> Int:
     # literal IP short-circuit
     var lit = resolve_dns("203.0.113.7", server=_server())
     f += check(
-        len(lit) == 1 and lit[0] == IpAddress.v4(203, 0, 113, 7),
+        len(lit) == 1
+        and lit[0] == SocketAddr.v4(Ipv4Address(203, 0, 113, 7), 0),
         "dns: literal ip fast path",
     )
     if f == 0:

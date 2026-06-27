@@ -2,7 +2,6 @@
 # real failures through the public API and checks that the typed
 # helpers classify them correctly.
 
-from socket.addr import IpAddress, SocketAddr
 from socket.errors import (
     ECONNREFUSED,
     EHOSTUNREACH,

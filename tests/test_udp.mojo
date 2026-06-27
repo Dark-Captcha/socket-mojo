@@ -2,7 +2,7 @@
 # sender on an ephemeral port (kernel-assigned); the sender sends a
 # datagram to the listener, the listener replies, the sender receives.
 
-from socket.addr import IpAddress, SocketAddr
+from socket.addr import Ipv4Address, SocketAddr
 from socket.udp import UdpSocket
 from tests.helpers import check
 
@@ -12,9 +12,9 @@ def run() raises -> Int:
 
     var listen_port = UInt16(19601)
     var server = UdpSocket.bind(
-        SocketAddr(IpAddress.loopback_v4(), listen_port)
+        SocketAddr.v4(Ipv4Address.loopback(), listen_port)
     )
-    var server_addr = SocketAddr(IpAddress.loopback_v4(), listen_port)
+    var server_addr = SocketAddr.v4(Ipv4Address.loopback(), listen_port)
 
     var client = UdpSocket.open()
     client.set_read_timeout(2.0)
