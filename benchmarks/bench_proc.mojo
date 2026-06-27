@@ -33,12 +33,7 @@ from socket._syscalls import (
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
-from socket.ring import (
-    KIND_ACCEPT_MULTI,
-    KIND_CONNECT,
-    KIND_RECV_MULTI,
-    Ring,
-)
+from socket.ring import CompletionKind, Ring
 from std.memory import UnsafePointer
 
 
@@ -49,18 +44,24 @@ def _bind_listener(port: UInt16, reuseport: Bool = False) raises -> Int32:
     var lfd = Int32(rc)
     var one = Int32(1)
     _ = sys_setsockopt(
-        lfd, SOL_SOCKET, SO_REUSEADDR,
-        UnsafePointer(to=one).bitcast[UInt8](), 4,
+        lfd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        UnsafePointer(to=one).bitcast[UInt8](),
+        4,
     )
     if reuseport:
         _ = sys_setsockopt(
-            lfd, SOL_SOCKET, SO_REUSEPORT,
-            UnsafePointer(to=one).bitcast[UInt8](), 4,
+            lfd,
+            SOL_SOCKET,
+            SO_REUSEPORT,
+            UnsafePointer(to=one).bitcast[UInt8](),
+            4,
         )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+        sa.unsafe_ptr(), False, ip.octets, port
     )
     if sys_bind(lfd, sa.unsafe_ptr(), Int(alen)) != 0:
         raise Error("bench: bind")
@@ -95,11 +96,11 @@ def _run_server(
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_ACCEPT_MULTI:
+            if done.kind == CompletionKind.ACCEPT_MULTI:
                 if done.res > 0:
                     _ = ring.recv_multishot(done.res)
                     accepted += 1
-            elif done.kind == KIND_RECV_MULTI:
+            elif done.kind == CompletionKind.RECV_MULTI:
                 if done.res <= 0:
                     if done.bid >= 0:
                         ring.recycle_buffer(done.bid)
@@ -151,7 +152,7 @@ def _run_client(
             continue
         var done = c.take()
         done.ok()
-        if done.kind == KIND_CONNECT:
+        if done.kind == CompletionKind.CONNECT:
             connected += 1
 
     # Arm recv on every conn and prime the first ping.
@@ -171,7 +172,7 @@ def _run_client(
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_RECV_MULTI:
+            if done.kind == CompletionKind.RECV_MULTI:
                 if done.res <= 0:
                     if done.bid >= 0:
                         ring.recycle_buffer(done.bid)

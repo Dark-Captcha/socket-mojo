@@ -40,8 +40,15 @@ struct BufRing(Movable):
     def __init__(
         out self, ring_fd: Int32, bgid: UInt16, entries: Int, buf_size: Int
     ) raises:
+        # io_uring's per-group bid is u16, so the kernel cap is 65536.
+        # buf_size lives in a u32 SQE field; cap at 16 MiB (4 huge
+        # pages) before anything starts looking like a typo.
+        if entries <= 0 or entries > 65536:
+            raise Error("socket.bufring: entries must be in 1..65536")
         if entries & (entries - 1) != 0:
             raise Error("socket.bufring: entries must be a power of two")
+        if buf_size <= 0 or buf_size > 16 * 1024 * 1024:
+            raise Error("socket.bufring: buf_size must be in 1..16 MiB")
         self.bgid = bgid
         self.entries = entries
         self.buf_size = buf_size

@@ -38,10 +38,11 @@ from socket.dnswire import (
     dns_build_query,
     dns_parse_response,
 )
-from socket.ring import KIND_RECV, KIND_SEND, Completion, Ring
+from socket.ring import Completion, CompletionKind, Ring
 
 
 # --- file reading helpers --------------------------------------------
+
 
 def _read_file_bytes(path: String) raises -> List[UInt8]:
     """Read a whole small text file. Used for /etc/hosts and
@@ -49,9 +50,7 @@ def _read_file_bytes(path: String) raises -> List[UInt8]:
     var path_c = List[UInt8](capacity=path.byte_length() + 1)
     path_c.extend(path.as_bytes())
     path_c.append(0)
-    var rc = sys_openat(
-        AT_FDCWD, path_c.unsafe_ptr(), O_RDONLY | O_CLOEXEC
-    )
+    var rc = sys_openat(AT_FDCWD, path_c.unsafe_ptr(), O_RDONLY | O_CLOEXEC)
     if rc < 0:
         raise Error(
             "socket.dns: open " + path + " " + errno_message(Int32(-rc))
@@ -75,6 +74,7 @@ def _read_file_bytes(path: String) raises -> List[UInt8]:
 
 
 # --- tiny line/token parser ------------------------------------------
+
 
 @always_inline
 def _lower(b: UInt8) -> UInt8:
@@ -129,6 +129,7 @@ def _tokenize_line(line: Span[UInt8, _]) -> List[Int]:
 
 # --- /etc/hosts ------------------------------------------------------
 
+
 def _lookup_hosts(host: String) -> List[IpAddress]:
     """Walk /etc/hosts looking for `host`. Returns matching IPs in
     file order; empty if the file is missing or no match. ASCII
@@ -181,6 +182,7 @@ def _hosts_match_line(
 
 # --- /etc/resolv.conf ------------------------------------------------
 
+
 def _read_nameservers() -> List[SocketAddr]:
     """Parse `nameserver <ip>` directives. Returns the configured
     nameservers (port 53). Empty list if the file is missing."""
@@ -227,6 +229,7 @@ def _resolv_collect_line(
 
 # --- DNS over io_uring -----------------------------------------------
 
+
 def _random_txid() raises -> UInt16:
     # transaction ids must be unpredictable (spoofing resistance)
     var b = InlineArray[UInt8, 2](fill=0)
@@ -246,12 +249,16 @@ def _connected_socket(server: SocketAddr, socktype: Int) raises -> Int32:
     var fd = Int32(rc)
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(),
+        sa.unsafe_ptr(),
         server.ip.is_v6,
         server.ip.octets,
         server.port,
     )
-    var crc = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
+    var crc: Int
+    while True:
+        crc = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
+        if crc != -4:  # not EINTR
+            break
     if crc != 0:
         var msg = errno_message(Int32(-crc))
         _ = sys_close(fd)
@@ -269,9 +276,9 @@ def _await_recv(mut ring: Ring) raises -> Completion:
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_RECV:
+            if done.kind == CompletionKind.RECV:
                 return done^
-            if done.kind == KIND_SEND:
+            if done.kind == CompletionKind.SEND:
                 done.ok()
             # timeout partners and close acks: nothing to check
 
@@ -417,6 +424,7 @@ def resolve_dns(
 
 
 # --- public entry point ----------------------------------------------
+
 
 def resolve(host: String) raises -> List[IpAddress]:
     """Resolve `host` to a list of IP addresses (A records first,

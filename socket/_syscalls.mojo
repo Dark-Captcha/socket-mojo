@@ -18,6 +18,7 @@ from std.sys.intrinsics import inlined_assembly
 
 # --- syscall trampoline -----------------------------------------------
 
+
 @always_inline
 def syscall(
     n: Int,
@@ -157,6 +158,7 @@ comptime SOCKADDR_STORAGE_SIZE = 28
 
 # --- syscall wrappers -------------------------------------------------
 
+
 @always_inline
 def sys_socket(domain: Int, type_: Int, protocol: Int) -> Int:
     """SOCK_CLOEXEC is OR'd into type_ by callers that need it; this
@@ -170,9 +172,7 @@ def sys_close(fd: Int32) -> Int:
 
 
 @always_inline
-def sys_bind(
-    fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int
-) -> Int:
+def sys_bind(fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int) -> Int:
     return syscall(SYS_BIND, Int(fd), Int(addr), addr_len)
 
 
@@ -182,9 +182,7 @@ def sys_listen(fd: Int32, backlog: Int) -> Int:
 
 
 @always_inline
-def sys_connect(
-    fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int
-) -> Int:
+def sys_connect(fd: Int32, addr: UnsafePointer[UInt8, _], addr_len: Int) -> Int:
     return syscall(SYS_CONNECT, Int(fd), Int(addr), addr_len)
 
 
@@ -238,9 +236,7 @@ def sys_sendto(
     addr: UnsafePointer[UInt8, _],
     addr_len: Int,
 ) -> Int:
-    return syscall(
-        SYS_SENDTO, Int(fd), Int(buf), n, flags, Int(addr), addr_len
-    )
+    return syscall(SYS_SENDTO, Int(fd), Int(buf), n, flags, Int(addr), addr_len)
 
 
 @always_inline
@@ -258,16 +254,12 @@ def sys_recvfrom(
 
 
 @always_inline
-def sys_writev(
-    fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int
-) -> Int:
+def sys_writev(fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int) -> Int:
     return syscall(SYS_WRITEV, Int(fd), Int(iov), iovcnt)
 
 
 @always_inline
-def sys_readv(
-    fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int
-) -> Int:
+def sys_readv(fd: Int32, iov: UnsafePointer[UInt8, _], iovcnt: Int) -> Int:
     return syscall(SYS_READV, Int(fd), Int(iov), iovcnt)
 
 
@@ -279,9 +271,7 @@ def sys_setsockopt(
     val: UnsafePointer[UInt8, _],
     val_len: Int,
 ) -> Int:
-    return syscall(
-        SYS_SETSOCKOPT, Int(fd), level, name, Int(val), val_len
-    )
+    return syscall(SYS_SETSOCKOPT, Int(fd), level, name, Int(val), val_len)
 
 
 @always_inline
@@ -340,9 +330,7 @@ def sys_socketpair(
     protocol: Int,
     out_pair: UnsafePointer[UInt8, _],
 ) -> Int:
-    return syscall(
-        SYS_SOCKETPAIR, domain, type_, protocol, Int(out_pair)
-    )
+    return syscall(SYS_SOCKETPAIR, domain, type_, protocol, Int(out_pair))
 
 
 @always_inline
@@ -385,20 +373,17 @@ def sys_openat(
 
 
 @always_inline
-def sys_read(
-    fd: Int32, buf: UnsafePointer[UInt8, _], n: Int
-) -> Int:
+def sys_read(fd: Int32, buf: UnsafePointer[UInt8, _], n: Int) -> Int:
     return syscall(SYS_READ, Int(fd), Int(buf), n)
 
 
 @always_inline
-def sys_getrandom(
-    buf: UnsafePointer[UInt8, _], n: Int, flags: Int
-) -> Int:
+def sys_getrandom(buf: UnsafePointer[UInt8, _], n: Int, flags: Int) -> Int:
     return syscall(SYS_GETRANDOM, Int(buf), n, flags)
 
 
 # --- error helpers ----------------------------------------------------
+
 
 @always_inline
 def is_syscall_error(rc: Int) -> Bool:
@@ -461,8 +446,11 @@ def errno_message(code: Int32) -> String:
 
 # --- sockaddr layout helpers ------------------------------------------
 
-def write_sockaddr(
-    out_buf: UnsafePointer[UInt8, MutAnyOrigin],
+
+def write_sockaddr[
+    O: Origin[mut=True]
+](
+    out_buf: UnsafePointer[UInt8, O],
     ip_is_v6: Bool,
     octets: InlineArray[UInt8, 16],
     port: UInt16,

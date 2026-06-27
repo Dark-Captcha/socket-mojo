@@ -33,13 +33,7 @@ from socket._syscalls import (
 from socket.addr import IpAddress, SocketAddr
 from socket.nonblocking import set_nonblocking
 from socket.poller import Poller
-from socket.ring import (
-    KIND_ACCEPT_DIRECT,
-    KIND_RECV,
-    KIND_RECV_MULTI,
-    KIND_SEND,
-    Ring,
-)
+from socket.ring import CompletionKind, Ring
 
 
 def _pair(port: UInt16) raises -> Tuple[Int32, Int32]:
@@ -60,7 +54,7 @@ def _pair(port: UInt16) raises -> Tuple[Int32, Int32]:
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+        sa.unsafe_ptr(), False, ip.octets, port
     )
     var brc = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
@@ -103,16 +97,12 @@ def _bench_blocking(msg_size: Int, rounds: Int) raises -> Float64:
         _ = sys_send(cfd, msg.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         var got = 0
         while got < msg_size:
-            var n = sys_recv(
-                afd, buf.unsafe_ptr() + got, msg_size - got, 0
-            )
+            var n = sys_recv(afd, buf.unsafe_ptr() + got, msg_size - got, 0)
             got += Int(n)
         _ = sys_send(afd, buf.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         got = 0
         while got < msg_size:
-            var n = sys_recv(
-                cfd, buf.unsafe_ptr() + got, msg_size - got, 0
-            )
+            var n = sys_recv(cfd, buf.unsafe_ptr() + got, msg_size - got, 0)
             got += Int(n)
     var t1 = perf_counter_ns()
     _ = sys_close(afd)
@@ -142,7 +132,7 @@ def _bench_ring_single(msg_size: Int, rounds: Int) raises -> Float64:
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_RECV_MULTI:
+            if done.kind == CompletionKind.RECV_MULTI:
                 if done.res <= 0:
                     continue
                 var view = ring.buffer_view(done.bid, Int(done.res))
@@ -167,9 +157,7 @@ def _bench_ring_fanout(
     # connections through ONE ring. Each conn ping-pongs in parallel;
     # one wait() reaps a burst of completions per syscall. SQPOLL on
     # top drops the per-submit syscall — the kthread polls our tail.
-    var ring = Ring(
-        max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000
-    )
+    var ring = Ring(max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000)
     ring.setup_buffers(entries=max(64, conns * 2), buf_size=32768, bgid=1)
     var afds = List[Int32]()
     var cfds = List[Int32]()
@@ -201,7 +189,7 @@ def _bench_ring_fanout(
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_RECV_MULTI:
+            if done.kind == CompletionKind.RECV_MULTI:
                 if done.res <= 0:
                     continue
                 var view = ring.buffer_view(done.bid, Int(done.res))
@@ -227,9 +215,7 @@ def _bench_ring_fanout_direct(
     registered table: socket_direct for clients, accept_direct for
     servers, recv/send/close with fixed=True. The kernel skips the
     per-op fget refcount bump on the hot path."""
-    var ring = Ring(
-        max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000
-    )
+    var ring = Ring(max(256, conns * 4), sqpoll=sqpoll, sqpoll_idle_ms=2000)
     ring.register_files(conns * 2 + 16)
     ring.setup_buffers(entries=max(64, conns * 2), buf_size=32768, bgid=1)
 
@@ -240,7 +226,6 @@ def _bench_ring_fanout_direct(
     var dest = SocketAddr(IpAddress.v4(127, 0, 0, 1), port)
 
     var afds = List[Int32]()  # server-side direct slots
-    var cfds = List[Int32]()  # client-side direct slots
     var accept_ops = List[UInt64]()
     var connect_ops = List[UInt64]()
     var sock_ops = List[UInt64]()
@@ -248,7 +233,9 @@ def _bench_ring_fanout_direct(
     # First open all client direct sockets via OP_SOCKET (synchronous
     # in the kernel; they all complete after one wait).
     for _ in range(conns):
-        sock_ops.append(ring.socket_direct(Int(AF_INET), Int(SOCK_STREAM), 0).raw)
+        sock_ops.append(
+            ring.socket_direct(Int(AF_INET), Int(SOCK_STREAM), 0).raw
+        )
     _ = ring.wait(min_complete=conns)
     var client_slots = List[Int32]()
     while True:
@@ -262,9 +249,7 @@ def _bench_ring_fanout_direct(
     # Then issue accept_direct(s) and connect_fixed(s) interleaved.
     for i in range(conns):
         accept_ops.append(ring.accept_direct(lfd).raw)
-        connect_ops.append(
-            ring.connect(client_slots[i], dest, fixed=True).raw
-        )
+        connect_ops.append(ring.connect(client_slots[i], dest, fixed=True).raw)
     _ = ring.wait(min_complete=conns * 2)
     while True:
         var c = ring.next_completion()
@@ -272,9 +257,9 @@ def _bench_ring_fanout_direct(
             break
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT_DIRECT:
+        if done.kind == CompletionKind.ACCEPT_DIRECT:
             afds.append(done.res)
-    cfds = client_slots.copy()
+    var cfds = client_slots.copy()
 
     # Arm multishot recv on every direct fd.
     for i in range(conns):
@@ -298,7 +283,7 @@ def _bench_ring_fanout_direct(
             if not c:
                 break
             var done = c.take()
-            if done.kind == KIND_RECV_MULTI:
+            if done.kind == CompletionKind.RECV_MULTI:
                 if done.res <= 0:
                     continue
                 var view = ring.buffer_view(done.bid, Int(done.res))
@@ -340,7 +325,7 @@ def _pair_listener(port: UInt16) raises -> Int32:
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
     var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
+        sa.unsafe_ptr(), False, ip.octets, port
     )
     _ = sys_bind(lfd, sa.unsafe_ptr(), Int(alen))
     _ = sys_listen(lfd, 256)
@@ -386,9 +371,7 @@ def _bench_poller(msg_size: Int, rounds: Int) raises -> Float64:
         _ = sys_send(afd, buf.unsafe_ptr(), msg_size, MSG_NOSIGNAL)
         var back = 0
         while back < msg_size:
-            var n = sys_recv(
-                cfd, buf.unsafe_ptr() + back, msg_size - back, 0
-            )
+            var n = sys_recv(cfd, buf.unsafe_ptr() + back, msg_size - back, 0)
             back += Int(n)
     var t1 = perf_counter_ns()
     poller.unregister(afd)
@@ -429,9 +412,7 @@ def main() raises:
         var rate = _bench_ring_fanout(64, per, conns)
         var rate_sq = _bench_ring_fanout(64, per, conns, sqpoll=True)
         var rate_dx = _bench_ring_fanout_direct(64, per, conns)
-        var rate_dx_sq = _bench_ring_fanout_direct(
-            64, per, conns, sqpoll=True
-        )
+        var rate_dx_sq = _bench_ring_fanout_direct(64, per, conns, sqpoll=True)
         print(
             String(conns) + " conns x 64B: ",
             " ring",

@@ -64,7 +64,7 @@ struct UdpSocket(Movable):
         )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr().as_unsafe_any_origin(),
+            sa.unsafe_ptr(),
             addr.ip.is_v6,
             addr.ip.octets,
             addr.port,
@@ -92,16 +92,18 @@ struct UdpSocket(Movable):
         send_to/recv_from for symmetry)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr().as_unsafe_any_origin(),
+            sa.unsafe_ptr(),
             peer.ip.is_v6,
             peer.ip.octets,
             peer.port,
         )
-        var rv = sys_connect(self.fd, sa.unsafe_ptr(), Int(alen))
+        var rv: Int
+        while True:
+            rv = sys_connect(self.fd, sa.unsafe_ptr(), Int(alen))
+            if rv != -4:  # not EINTR
+                break
         if rv != 0:
-            raise Error(
-                "socket.udp: connect(2) " + errno_message(Int32(-rv))
-            )
+            raise Error("socket.udp: connect(2) " + errno_message(Int32(-rv)))
 
     def send_to(mut self, data: Span[UInt8, _], peer: SocketAddr) raises -> Int:
         """Send one datagram. Returns the number of bytes the kernel
@@ -109,7 +111,7 @@ struct UdpSocket(Movable):
         userland)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr().as_unsafe_any_origin(),
+            sa.unsafe_ptr(),
             peer.ip.is_v6,
             peer.ip.octets,
             peer.port,
@@ -157,9 +159,7 @@ struct UdpSocket(Movable):
                 break
             if n == -4:  # EINTR: retry transparently
                 continue
-            raise Error(
-                "socket.udp: recvfrom(2) " + errno_message(Int32(-n))
-            )
+            raise Error("socket.udp: recvfrom(2) " + errno_message(Int32(-n)))
         buf.resize(unsafe_uninit_length=n)
         var is_v6: Bool
         var octets: InlineArray[UInt8, 16]

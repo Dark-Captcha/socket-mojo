@@ -22,7 +22,8 @@
 #       var c = ring.next_completion()
 #       if not c: break
 #       var done = c.value()
-#       if done.kind == KIND_RECV and done.op == op: ... done.take_buffer()
+#       if done.kind == CompletionKind.RECV and done.op == op:
+#           ... done.take_buffer() ...
 
 from std.memory import UnsafePointer, memcpy
 
@@ -65,81 +66,100 @@ from socket.uring_sys import (
     UringQueue,
 )
 
-comptime KIND_NOP = UInt8(0)
-comptime KIND_ACCEPT = UInt8(1)
-comptime KIND_CONNECT = UInt8(2)
-comptime KIND_RECV = UInt8(3)
-comptime KIND_SEND = UInt8(4)
-comptime KIND_CLOSE = UInt8(5)
-comptime KIND_SHUTDOWN = UInt8(6)
-comptime KIND_ACCEPT_MULTI = UInt8(7)
-comptime KIND_RECV_MULTI = UInt8(8)
-comptime KIND_TIMEOUT = UInt8(9)
-comptime KIND_CANCEL = UInt8(10)
-# A linked-timeout partner of a recv_with_timeout: the kernel always
-# posts its CQE, but the engine drains it internally — callers see
-# only the recv. Without this, forgetting to reap the partner leaks
-# both the slot and one inflight count.
-comptime KIND_TIMEOUT_LINKED = UInt8(11)
-# Registered fd table family. CQE.res for these is a *slot index*
-# in the registered table, not a kernel fd; downstream ops use that
-# slot with `fixed=True` (which sets IOSQE_FIXED_FILE on the SQE).
-comptime KIND_ACCEPT_DIRECT = UInt8(12)
-comptime KIND_ACCEPT_MULTI_DIRECT = UInt8(13)
-comptime KIND_SOCKET = UInt8(14)
-# OP_SEND_ZC posts TWO CQEs per submission — the "send done" one
-# (carries F_MORE; res = bytes sent) which the engine surfaces, and
-# the "buffer reusable" notif (F_NOTIF, no F_MORE) which the engine
-# drains. The slot stays alive across both so the user-passed
-# buffer survives the kernel's retransmit window.
-comptime KIND_SEND_ZC = UInt8(15)
-# Cross-ring messaging. KIND_MSG_RING is the LOCAL CQE the sender
-# gets back (an ack: res = 0 on delivery, -errno on failure).
-# KIND_MSG_INCOMING is the CQE the kernel posts on the TARGET ring;
-# it has no associated local slot (the sender constructed the
-# target's user_data, not the engine), so next_completion() surfaces
-# it verbatim without slot lookup.
-comptime KIND_MSG_RING = UInt8(16)
-comptime KIND_MSG_INCOMING = UInt8(17)
 
+@fieldwise_init
+struct CompletionKind(Copyable, ImplicitlyCopyable, Movable):
+    """Operation-kind discriminant carried in the top byte of every
+    user_data, and surfaced as `Completion.kind`. The comptime
+    constants below are the canonical values — callers compare
+    against `CompletionKind.RECV` etc. rather than raw integers."""
 
-@always_inline
-def _kind_name(kind: UInt8) -> String:
-    if kind == KIND_ACCEPT:
-        return "accept"
-    if kind == KIND_CONNECT:
-        return "connect"
-    if kind == KIND_RECV:
-        return "recv"
-    if kind == KIND_SEND:
-        return "send"
-    if kind == KIND_CLOSE:
-        return "close"
-    if kind == KIND_SHUTDOWN:
-        return "shutdown"
-    if kind == KIND_ACCEPT_MULTI:
-        return "accept-multishot"
-    if kind == KIND_RECV_MULTI:
-        return "recv-multishot"
-    if kind == KIND_TIMEOUT:
-        return "timeout"
-    if kind == KIND_TIMEOUT_LINKED:
-        return "timeout-linked"
-    if kind == KIND_CANCEL:
-        return "cancel"
-    if kind == KIND_ACCEPT_DIRECT:
-        return "accept-direct"
-    if kind == KIND_ACCEPT_MULTI_DIRECT:
-        return "accept-multishot-direct"
-    if kind == KIND_SOCKET:
-        return "socket-direct"
-    if kind == KIND_SEND_ZC:
-        return "send-zc"
-    if kind == KIND_MSG_RING:
-        return "msg-ring"
-    if kind == KIND_MSG_INCOMING:
-        return "msg-incoming"
-    return "nop"
+    var value: Int
+
+    def __eq__(self, other: CompletionKind) -> Bool:
+        return self.value == other.value
+
+    def __ne__(self, other: CompletionKind) -> Bool:
+        return self.value != other.value
+
+    @always_inline
+    def to_byte(self) -> UInt8:
+        return UInt8(self.value)
+
+    def name(self) -> String:
+        if self == CompletionKind.ACCEPT:
+            return "accept"
+        if self == CompletionKind.CONNECT:
+            return "connect"
+        if self == CompletionKind.RECV:
+            return "recv"
+        if self == CompletionKind.SEND:
+            return "send"
+        if self == CompletionKind.CLOSE:
+            return "close"
+        if self == CompletionKind.SHUTDOWN:
+            return "shutdown"
+        if self == CompletionKind.ACCEPT_MULTI:
+            return "accept-multishot"
+        if self == CompletionKind.RECV_MULTI:
+            return "recv-multishot"
+        if self == CompletionKind.TIMEOUT:
+            return "timeout"
+        if self == CompletionKind.TIMEOUT_LINKED:
+            return "timeout-linked"
+        if self == CompletionKind.CANCEL:
+            return "cancel"
+        if self == CompletionKind.ACCEPT_DIRECT:
+            return "accept-direct"
+        if self == CompletionKind.ACCEPT_MULTI_DIRECT:
+            return "accept-multishot-direct"
+        if self == CompletionKind.SOCKET:
+            return "socket-direct"
+        if self == CompletionKind.SEND_ZC:
+            return "send-zc"
+        if self == CompletionKind.MSG_RING:
+            return "msg-ring"
+        if self == CompletionKind.MSG_INCOMING:
+            return "msg-incoming"
+        return "nop"
+
+    comptime NOP = CompletionKind(0)
+    comptime ACCEPT = CompletionKind(1)
+    comptime CONNECT = CompletionKind(2)
+    comptime RECV = CompletionKind(3)
+    comptime SEND = CompletionKind(4)
+    comptime CLOSE = CompletionKind(5)
+    comptime SHUTDOWN = CompletionKind(6)
+    comptime ACCEPT_MULTI = CompletionKind(7)
+    comptime RECV_MULTI = CompletionKind(8)
+    comptime TIMEOUT = CompletionKind(9)
+    comptime CANCEL = CompletionKind(10)
+    # A linked-timeout partner of a recv_with_timeout: the kernel
+    # always posts its CQE, but the engine drains it internally —
+    # callers see only the recv. Without this, forgetting to reap
+    # the partner leaks both the slot and one inflight count.
+    comptime TIMEOUT_LINKED = CompletionKind(11)
+    # Registered fd table family. CQE.res for these is a *slot
+    # index* in the registered table, not a kernel fd; downstream
+    # ops use that slot with `fixed=True` (sets IOSQE_FIXED_FILE).
+    comptime ACCEPT_DIRECT = CompletionKind(12)
+    comptime ACCEPT_MULTI_DIRECT = CompletionKind(13)
+    comptime SOCKET = CompletionKind(14)
+    # OP_SEND_ZC posts TWO CQEs per submission — the "send done"
+    # one (carries F_MORE; res = bytes sent) which the engine
+    # surfaces, and the "buffer reusable" notif (F_NOTIF, no
+    # F_MORE) which the engine drains. The slot stays alive
+    # across both so the user-passed buffer survives the kernel's
+    # retransmit window.
+    comptime SEND_ZC = CompletionKind(15)
+    # Cross-ring messaging. MSG_RING is the LOCAL CQE the sender
+    # gets back (an ack: res = 0 on delivery, -errno on failure).
+    # MSG_INCOMING is the CQE the kernel posts on the TARGET
+    # ring; it has no associated local slot (the sender
+    # constructed the target's user_data, not the engine), so
+    # next_completion() surfaces it verbatim without slot lookup.
+    comptime MSG_RING = CompletionKind(16)
+    comptime MSG_INCOMING = CompletionKind(17)
 
 
 struct OpId(Copyable, ImplicitlyCopyable, Movable):
@@ -161,7 +181,7 @@ struct _OpSlot(Movable):
     # Generation of the CURRENT (or next) occupant; bumped on free.
     # 24 bits used (masked on increment); 32-bit field for arithmetic.
     var gen: UInt32
-    var kind: UInt8
+    var kind: CompletionKind
     var active: Bool
     var fd: Int32
     # All kernel-visible memory for this op. For send: the payload.
@@ -171,7 +191,7 @@ struct _OpSlot(Movable):
 
     def __init__(out self):
         self.gen = 0
-        self.kind = KIND_NOP
+        self.kind = CompletionKind.NOP
         self.active = False
         self.fd = -1
         self.buf = List[UInt8]()
@@ -183,7 +203,7 @@ struct Completion(Movable):
     For recv/send the buffer is recovered with take_buffer()."""
 
     var op: OpId
-    var kind: UInt8
+    var kind: CompletionKind
     var fd: Int32  # the fd the op was submitted against
     var res: Int32
     var buf: List[UInt8]
@@ -195,7 +215,7 @@ struct Completion(Movable):
     def __init__(
         out self,
         op: OpId,
-        kind: UInt8,
+        kind: CompletionKind,
         fd: Int32,
         res: Int32,
         var buf: List[UInt8],
@@ -214,7 +234,7 @@ struct Completion(Movable):
         if self.res < 0:
             raise Error(
                 "socket.ring: "
-                + _kind_name(self.kind)
+                + self.kind.name()
                 + " failed: "
                 + errno_message(Int32(-self.res))
             )
@@ -228,10 +248,13 @@ struct Completion(Movable):
 
     def accepted_peer(self) raises -> SocketAddr:
         """For accept / accept_direct completions: the peer's address.
-        Multishot variants (KIND_ACCEPT_MULTI / _MULTI_DIRECT) don't
+        Multishot variants (ACCEPT_MULTI / ACCEPT_MULTI_DIRECT) don't
         carry per-completion sockaddr — fetch via getpeername if
         needed."""
-        var ok = self.kind == KIND_ACCEPT or self.kind == KIND_ACCEPT_DIRECT
+        var ok = (
+            self.kind == CompletionKind.ACCEPT
+            or self.kind == CompletionKind.ACCEPT_DIRECT
+        )
         if not ok or len(self.buf) < SOCKADDR_STORAGE_SIZE:
             raise Error("socket.ring: not an accept completion")
         var parsed = read_sockaddr(self.buf.unsafe_ptr())
@@ -311,7 +334,7 @@ struct Ring(Movable):
         target_res: Int32 = 0,
     ) raises -> OpId:
         """Post a CQE on `target_ring_fd` (a different Ring's io_uring
-        fd). The target's next reap surfaces a KIND_MSG_INCOMING
+        fd). The target's next reap surfaces a CompletionKind.MSG_INCOMING
         completion carrying `payload` (low 56 bits) and `target_res`.
         Top 8 bits of the target's user_data are reserved by the engine
         for the kind tag — callers must keep their payload below 2^56.
@@ -323,12 +346,16 @@ struct Ring(Movable):
                 "socket.ring: msg_ring payload must fit in the low 56 bits"
             )
         self._room()
-        var idx = self._alloc(KIND_MSG_RING, target_ring_fd, List[UInt8]())
-        var local_ud = self._user_data(idx, KIND_MSG_RING)
-        # Target sees this user_data verbatim — tag with KIND_MSG_INCOMING
+        var idx = self._alloc(
+            CompletionKind.MSG_RING, target_ring_fd, List[UInt8]()
+        )
+        var local_ud = self._user_data(idx, CompletionKind.MSG_RING)
+        # Target sees this user_data verbatim — tag with MSG_INCOMING
         # in the top 8 bits so the receiver's next_completion() handles
         # it without a slot lookup.
-        var target_ud = payload | (UInt64(KIND_MSG_INCOMING) << 56)
+        var target_ud = payload | (
+            UInt64(CompletionKind.MSG_INCOMING.value) << 56
+        )
         # SQE for OP_MSG_RING (io_uring/msg_ring.c):
         #   sqe.fd  = target ring fd          (push_sqe `fd`)
         #   sqe.addr = mode (0 = MSG_DATA)    (push_sqe `addr`)
@@ -364,12 +391,12 @@ struct Ring(Movable):
             raise Error("socket.ring: buffer_view bid/length out of range")
         # The backing buffer is owned by the BufRing held inside the
         # Ring; the caller-visible Span lives only until recycle_buffer
-        # is called. We discard the natural origin explicitly so the
-        # Span type doesn't leak the BufRing's lifetime into callers.
-        var p = (
-            self.bufs.value().backing.unsafe_ptr()
-            + bid * self.bufs.value().buf_size
-        ).as_unsafe_any_origin()
+        # is called. The natural origin would leak the BufRing's
+        # lifetime into callers, so we erase it explicitly via the
+        # any-origin pointer construct.
+        var base = self.bufs.value().backing.unsafe_ptr()
+        var raw = Int(base) + bid * self.bufs.value().buf_size
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=raw)
         return Span(ptr=p, length=length)
 
     def recycle_buffer(mut self, bid: Int) raises:
@@ -402,9 +429,7 @@ struct Ring(Movable):
         )
         if rc < 0:
             raise Error(
-                "socket.ring: register_files failed (errno "
-                + String(-rc)
-                + ")"
+                "socket.ring: register_files failed (errno " + String(-rc) + ")"
             )
         _ = fds[0]  # keep alive past the kernel read
 
@@ -427,7 +452,9 @@ struct Ring(Movable):
 
     # --- slot management --------------------------------------------------
 
-    def _alloc(mut self, kind: UInt8, fd: Int32, var buf: List[UInt8]) -> Int:
+    def _alloc(
+        mut self, kind: CompletionKind, fd: Int32, var buf: List[UInt8]
+    ) -> Int:
         var idx: Int
         if len(self.free) > 0:
             idx = Int(self.free.pop())
@@ -441,11 +468,11 @@ struct Ring(Movable):
         return idx
 
     @always_inline
-    def _user_data(self, idx: Int, kind: UInt8) -> UInt64:
+    def _user_data(self, idx: Int, kind: CompletionKind) -> UInt64:
         return (
             UInt64(idx)
             | (UInt64(self.slots[idx].gen & 0xFFFFFF) << 32)
-            | (UInt64(kind) << 56)
+            | (UInt64(kind.value) << 56)
         )
 
     def _room(mut self) raises:
@@ -457,8 +484,8 @@ struct Ring(Movable):
 
     def nop(mut self) raises -> OpId:
         self._room()
-        var idx = self._alloc(KIND_NOP, -1, List[UInt8]())
-        var ud = self._user_data(idx, KIND_NOP)
+        var idx = self._alloc(CompletionKind.NOP, -1, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.NOP)
         self.q.push_sqe(OP_NOP, -1, 0, 0, 0, 0, ud)
         self.inflight += 1
         return OpId(ud)
@@ -472,8 +499,8 @@ struct Ring(Movable):
         st[SOCKADDR_STORAGE_SIZE] = UInt8(SOCKADDR_STORAGE_SIZE)
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
         var len_ptr = UInt64(Int(st.unsafe_ptr() + SOCKADDR_STORAGE_SIZE))
-        var idx = self._alloc(KIND_ACCEPT, listen_fd, st^)
-        var ud = self._user_data(idx, KIND_ACCEPT)
+        var idx = self._alloc(CompletionKind.ACCEPT, listen_fd, st^)
+        var ud = self._user_data(idx, CompletionKind.ACCEPT)
         self.q.push_sqe(OP_ACCEPT, listen_fd, addr_ptr, 0, len_ptr, 0, ud)
         self.inflight += 1
         return OpId(ud)
@@ -482,19 +509,29 @@ struct Ring(Movable):
         mut self, fd: Int32, addr: SocketAddr, *, fixed: Bool = False
     ) raises -> OpId:
         self._room()
-        var st = List[UInt8](length=SOCKADDR_STORAGE_SIZE, fill=0)
+        # write_sockaddr zero-fills the trailing/padding bytes itself,
+        # so we allocate uninitialized.
+        var st = List[UInt8](capacity=SOCKADDR_STORAGE_SIZE)
+        st.resize(unsafe_uninit_length=SOCKADDR_STORAGE_SIZE)
         var alen = write_sockaddr(
-            st.unsafe_ptr().as_unsafe_any_origin(),
+            st.unsafe_ptr(),
             addr.ip.is_v6,
             addr.ip.octets,
             addr.port,
         )
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
-        var idx = self._alloc(KIND_CONNECT, fd, st^)
-        var ud = self._user_data(idx, KIND_CONNECT)
+        var idx = self._alloc(CompletionKind.CONNECT, fd, st^)
+        var ud = self._user_data(idx, CompletionKind.CONNECT)
         var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
         self.q.push_sqe(
-            OP_CONNECT, fd, addr_ptr, 0, UInt64(alen), 0, ud, sqe_flags=sqe_flags
+            OP_CONNECT,
+            fd,
+            addr_ptr,
+            0,
+            UInt64(alen),
+            0,
+            ud,
+            sqe_flags=sqe_flags,
         )
         self.inflight += 1
         return OpId(ud)
@@ -506,14 +543,16 @@ struct Ring(Movable):
         registered fd table (set up by register_files()) instead of
         a raw kernel fd. The kernel skips the fget refcount bump
         that a raw fd costs every op."""
+        if max_bytes <= 0 or max_bytes > 0x7FFF_FFFF:
+            raise Error("socket.ring: recv max_bytes must be in 1..2^31-1")
         self._room()
         # Uninitialized: the kernel fills it; a zero-fill would be thrown
         # away on the next syscall.
         var buf = List[UInt8](capacity=max_bytes)
         buf.resize(unsafe_uninit_length=max_bytes)
         var ptr = UInt64(Int(buf.unsafe_ptr()))
-        var idx = self._alloc(KIND_RECV, fd, buf^)
-        var ud = self._user_data(idx, KIND_RECV)
+        var idx = self._alloc(CompletionKind.RECV, fd, buf^)
+        var ud = self._user_data(idx, CompletionKind.RECV)
         var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
         self.q.push_sqe(
             OP_RECV,
@@ -546,7 +585,7 @@ struct Ring(Movable):
         self._room()
         var ptr = UInt64(Int(data.unsafe_ptr()))
         var n = len(data)
-        var kind = KIND_SEND_ZC if zero_copy else KIND_SEND
+        var kind = CompletionKind.SEND_ZC if zero_copy else CompletionKind.SEND
         var op = OP_SEND_ZC if zero_copy else OP_SEND
         var idx = self._alloc(kind, fd, data^)
         var ud = self._user_data(idx, kind)
@@ -589,8 +628,8 @@ struct Ring(Movable):
         buffer or pool and want to skip the per-call allocation in
         send_copy. Symmetric with `recv` accepting any pointer."""
         self._room()
-        var idx = self._alloc(KIND_SEND, fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_SEND)
+        var idx = self._alloc(CompletionKind.SEND, fd, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.SEND)
         var sqe_flags = IOSQE_FIXED_FILE if fixed else UInt8(0)
         self.q.push_sqe(
             OP_SEND,
@@ -605,15 +644,13 @@ struct Ring(Movable):
         self.inflight += 1
         return OpId(ud)
 
-    def close_fd(
-        mut self, fd: Int32, *, fixed: Bool = False
-    ) raises -> OpId:
+    def close_fd(mut self, fd: Int32, *, fixed: Bool = False) raises -> OpId:
         """When `fixed=True`, closes a direct fd (releases the table
         slot via sqe.file_index); the slot is available for
         re-allocation immediately after this op is processed."""
         self._room()
-        var idx = self._alloc(KIND_CLOSE, fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_CLOSE)
+        var idx = self._alloc(CompletionKind.CLOSE, fd, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.CLOSE)
         if fixed:
             # OP_CLOSE on a direct fd: the kernel rejects with EINVAL
             # if both sqe.fd and sqe.file_index are non-zero, so the
@@ -636,8 +673,8 @@ struct Ring(Movable):
 
     def shutdown(mut self, fd: Int32, how: Int32) raises -> OpId:
         self._room()
-        var idx = self._alloc(KIND_SHUTDOWN, fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_SHUTDOWN)
+        var idx = self._alloc(CompletionKind.SHUTDOWN, fd, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.SHUTDOWN)
         self.q.push_sqe(OP_SHUTDOWN, fd, 0, UInt32(how), 0, 0, ud)
         self.inflight += 1
         return OpId(ud)
@@ -649,8 +686,10 @@ struct Ring(Movable):
         getpeername if a protocol needs them, or use accept_direct
         single-shots (which DO carry peer addresses)."""
         self._room()
-        var idx = self._alloc(KIND_ACCEPT_MULTI, listen_fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_ACCEPT_MULTI)
+        var idx = self._alloc(
+            CompletionKind.ACCEPT_MULTI, listen_fd, List[UInt8]()
+        )
+        var ud = self._user_data(idx, CompletionKind.ACCEPT_MULTI)
         self.q.push_sqe(
             OP_ACCEPT, listen_fd, 0, 0, 0, 0, ud, ioprio=ACCEPT_MULTISHOT
         )
@@ -669,8 +708,8 @@ struct Ring(Movable):
         st[SOCKADDR_STORAGE_SIZE] = UInt8(SOCKADDR_STORAGE_SIZE)
         var addr_ptr = UInt64(Int(st.unsafe_ptr()))
         var len_ptr = UInt64(Int(st.unsafe_ptr() + SOCKADDR_STORAGE_SIZE))
-        var idx = self._alloc(KIND_ACCEPT_DIRECT, listen_fd, st^)
-        var ud = self._user_data(idx, KIND_ACCEPT_DIRECT)
+        var idx = self._alloc(CompletionKind.ACCEPT_DIRECT, listen_fd, st^)
+        var ud = self._user_data(idx, CompletionKind.ACCEPT_DIRECT)
         self.q.push_sqe(
             OP_ACCEPT,
             listen_fd,
@@ -691,8 +730,10 @@ struct Ring(Movable):
         slot index; peer addresses are not collected (use
         accept_direct for those)."""
         self._room()
-        var idx = self._alloc(KIND_ACCEPT_MULTI_DIRECT, listen_fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_ACCEPT_MULTI_DIRECT)
+        var idx = self._alloc(
+            CompletionKind.ACCEPT_MULTI_DIRECT, listen_fd, List[UInt8]()
+        )
+        var ud = self._user_data(idx, CompletionKind.ACCEPT_MULTI_DIRECT)
         self.q.push_sqe(
             OP_ACCEPT,
             listen_fd,
@@ -715,8 +756,8 @@ struct Ring(Movable):
         index. Used to open client connections fully under the Ring
         (followed by a connect on the same slot)."""
         self._room()
-        var idx = self._alloc(KIND_SOCKET, -1, List[UInt8]())
-        var ud = self._user_data(idx, KIND_SOCKET)
+        var idx = self._alloc(CompletionKind.SOCKET, -1, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.SOCKET)
         # OP_SOCKET SQE encoding (io_uring/net.c):
         #   sqe.fd     = domain
         #   sqe.off    = type
@@ -751,8 +792,8 @@ struct Ring(Movable):
         if not self.bufs:
             raise Error("socket.ring: setup_buffers() first")
         self._room()
-        var idx = self._alloc(KIND_RECV_MULTI, fd, List[UInt8]())
-        var ud = self._user_data(idx, KIND_RECV_MULTI)
+        var idx = self._alloc(CompletionKind.RECV_MULTI, fd, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.RECV_MULTI)
         var sqe_flags = IOSQE_BUFFER_SELECT
         if fixed:
             sqe_flags |= IOSQE_FIXED_FILE
@@ -774,14 +815,19 @@ struct Ring(Movable):
     def timeout(mut self, nanoseconds: Int64) raises -> OpId:
         """A standalone timer: completes with res == -ETIME (-62) when
         it fires, -ECANCELED if cancelled."""
+        if nanoseconds < 0:
+            raise Error("socket.ring: timeout must be non-negative")
         self._room()
-        # __kernel_timespec { i64 sec, i64 nsec } — slot-owned
-        var ts = List[UInt8](length=16, fill=0)
+        # __kernel_timespec { i64 sec, i64 nsec } — slot-owned; both
+        # 8-byte halves are overwritten below, so a zero-fill init
+        # would be thrown away on the next syscall.
+        var ts = List[UInt8](capacity=16)
+        ts.resize(unsafe_uninit_length=16)
         ts.unsafe_ptr().bitcast[Int64]()[0] = nanoseconds // 1_000_000_000
         (ts.unsafe_ptr() + 8).bitcast[Int64]()[0] = nanoseconds % 1_000_000_000
         var ptr = UInt64(Int(ts.unsafe_ptr()))
-        var idx = self._alloc(KIND_TIMEOUT, -1, ts^)
-        var ud = self._user_data(idx, KIND_TIMEOUT)
+        var idx = self._alloc(CompletionKind.TIMEOUT, -1, ts^)
+        var ud = self._user_data(idx, CompletionKind.TIMEOUT)
         self.q.push_sqe(OP_TIMEOUT, -1, ptr, 1, 0, 0, ud)
         self.inflight += 1
         return OpId(ud)
@@ -793,9 +839,17 @@ struct Ring(Movable):
         -ECANCELED if no data arrives in time.
 
         The linked-timeout partner CQE the kernel posts is drained
-        inside the engine (kind KIND_TIMEOUT_LINKED); the caller sees
-        exactly ONE completion for the returned OpId — the recv,
-        carrying either bytes or -ECANCELED."""
+        inside the engine (kind CompletionKind.TIMEOUT_LINKED); the
+        caller sees exactly ONE completion for the returned OpId —
+        the recv, carrying either bytes or -ECANCELED."""
+        if max_bytes <= 0 or max_bytes > 0x7FFF_FFFF:
+            raise Error(
+                "socket.ring: recv_with_timeout max_bytes must be in 1..2^31-1"
+            )
+        if nanoseconds < 0:
+            raise Error(
+                "socket.ring: recv_with_timeout deadline must be non-negative"
+            )
         self._room()
         if self.q.sq_space() < 2:
             _ = self.q.enter(0)
@@ -815,8 +869,8 @@ struct Ring(Movable):
         (buf.unsafe_ptr() + max_bytes + 8).bitcast[Int64]()[0] = (
             nanoseconds % 1_000_000_000
         )
-        var idx = self._alloc(KIND_RECV, fd, buf^)
-        var ud = self._user_data(idx, KIND_RECV)
+        var idx = self._alloc(CompletionKind.RECV, fd, buf^)
+        var ud = self._user_data(idx, CompletionKind.RECV)
         self.q.push_sqe(
             OP_RECV,
             fd,
@@ -829,9 +883,9 @@ struct Ring(Movable):
         )
         # The linked timeout still gets a CQE (one of -ETIME if it
         # fired or -ECANCELED if recv won the race), but we tag it
-        # KIND_TIMEOUT_LINKED so next_completion() drops it silently.
-        var tidx = self._alloc(KIND_TIMEOUT_LINKED, -1, List[UInt8]())
-        var tud = self._user_data(tidx, KIND_TIMEOUT_LINKED)
+        # TIMEOUT_LINKED so next_completion() drops it silently.
+        var tidx = self._alloc(CompletionKind.TIMEOUT_LINKED, -1, List[UInt8]())
+        var tud = self._user_data(tidx, CompletionKind.TIMEOUT_LINKED)
         self.q.push_sqe(OP_LINK_TIMEOUT, -1, ts_ptr, 1, 0, 0, tud)
         self.inflight += 2
         return OpId(ud)
@@ -841,8 +895,8 @@ struct Ring(Movable):
         completes with -ECANCELED (or finishes first); this op's own
         completion is 0 on success, -ENOENT if nothing matched."""
         self._room()
-        var idx = self._alloc(KIND_CANCEL, -1, List[UInt8]())
-        var ud = self._user_data(idx, KIND_CANCEL)
+        var idx = self._alloc(CompletionKind.CANCEL, -1, List[UInt8]())
+        var ud = self._user_data(idx, CompletionKind.CANCEL)
         self.q.push_sqe(OP_ASYNC_CANCEL, -1, target.raw, 0, 0, 0, ud)
         self.inflight += 1
         return OpId(ud)
@@ -863,18 +917,18 @@ struct Ring(Movable):
         drained. Slot buffers move into the Completion here. A
         multishot completion with more=True leaves its op armed (the
         slot stays live); the terminal one (more=False) releases it.
-        KIND_TIMEOUT_LINKED CQEs (the partner of a recv_with_timeout)
+        CompletionKind.TIMEOUT_LINKED CQEs (the partner of a recv_with_timeout)
         are drained internally — they release their slot and we loop
         to the next CQE without surfacing them."""
         while True:
             if not self.q.cqe_pending():
                 return None
             var cqe = self.q.pop_cqe()
-            var kind = UInt8((cqe.user_data >> 56) & 0xFF)
-            # External msg_ring CQE: the sender packed KIND_MSG_INCOMING
+            var kind = CompletionKind(Int((cqe.user_data >> 56) & 0xFF))
+            # External msg_ring CQE: the sender packed MSG_INCOMING
             # in the top 8 bits and the low 56 bits are their payload —
             # there's no local slot to look up.
-            if kind == KIND_MSG_INCOMING:
+            if kind == CompletionKind.MSG_INCOMING:
                 return Completion(
                     OpId(cqe.user_data),
                     kind,
@@ -902,7 +956,7 @@ struct Ring(Movable):
             # result, drains the notif silently, keeps the slot
             # alive across both so the buffer remains pinned for
             # the kernel's retransmit window.
-            if kind == KIND_SEND_ZC:
+            if kind == CompletionKind.SEND_ZC:
                 if more:
                     return Completion(
                         OpId(cqe.user_data),
@@ -933,7 +987,7 @@ struct Ring(Movable):
                 )
             # Linked-timeout partner: release the slot and loop. The
             # caller never sees this CQE — they see only the recv's.
-            if kind == KIND_TIMEOUT_LINKED:
+            if kind == CompletionKind.TIMEOUT_LINKED:
                 self.slots[idx].active = False
                 self.slots[idx].gen += 1
                 self.free.append(UInt32(idx))
@@ -947,9 +1001,10 @@ struct Ring(Movable):
             self.free.append(UInt32(idx))
             self.inflight -= 1
             # recv: truncate the buffer to what actually arrived
-            if kind == KIND_RECV and cqe.res > 0 and Int(cqe.res) < len(buf):
+            var is_recv = kind == CompletionKind.RECV
+            if is_recv and cqe.res > 0 and Int(cqe.res) < len(buf):
                 buf.shrink(Int(cqe.res))
-            if kind == KIND_RECV and cqe.res <= 0:
+            if is_recv and cqe.res <= 0:
                 buf.shrink(0)
             return Completion(
                 OpId(cqe.user_data), kind, fd, cqe.res, buf^, bid, False

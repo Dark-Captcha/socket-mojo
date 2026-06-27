@@ -22,19 +22,15 @@ def set_nonblocking(fd: Int32, enabled: Bool = True) raises:
     var flags = sys_fcntl_getfl(fd)
     if flags < 0:
         raise Error(
-            "socket.nonblocking: fcntl(F_GETFL) "
-            + errno_message(Int32(-flags))
+            "socket.nonblocking: fcntl(F_GETFL) " + errno_message(Int32(-flags))
         )
-    var new_flags = (flags | O_NONBLOCK) if enabled else (
-        flags & ~O_NONBLOCK
-    )
+    var new_flags = (flags | O_NONBLOCK) if enabled else (flags & ~O_NONBLOCK)
     if new_flags == flags:
         return
     var rv = sys_fcntl_setfl(fd, new_flags)
     if rv != 0:
         raise Error(
-            "socket.nonblocking: fcntl(F_SETFL) "
-            + errno_message(Int32(-rv))
+            "socket.nonblocking: fcntl(F_SETFL) " + errno_message(Int32(-rv))
         )
 
 

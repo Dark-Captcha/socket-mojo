@@ -93,9 +93,38 @@ struct TcpSocket(Movable):
         var addrs = resolve(host)
         if len(addrs) == 0:
             _raise("socket.tcp: EAI_NONAME no addresses for '" + host + "'")
+        return TcpSocket.connect_to_addrs(
+            addrs, port, timeout_seconds=timeout_seconds
+        )
+
+    @staticmethod
+    def connect_to_addrs(
+        addrs: List[IpAddress],
+        port: UInt16,
+        *,
+        timeout_seconds: Float64 = 30.0,
+    ) raises -> TcpSocket:
+        """Like `connect`, but the caller pre-resolved addresses. Skips the
+        `resolve()` call — useful when paired with a DNS cache that hands you
+        a fresh address list per call without re-hitting the resolver.
+
+        Behaviour is otherwise identical to `connect()`: IPv4-first ordering,
+        try each address in turn, return the first successful socket. Raises
+        if `addrs` is empty or every candidate fails."""
+        if len(addrs) == 0:
+            _raise("socket.tcp: EAI_NONAME empty address list")
+        # Prefer IPv4 first: many hosts (and CI/sandbox environments) lack a
+        # usable IPv6 route, so try reachable A records before AAAA.
+        var ordered = List[IpAddress]()
+        for i in range(len(addrs)):
+            if not addrs[i].is_v6:
+                ordered.append(addrs[i])
+        for i in range(len(addrs)):
+            if addrs[i].is_v6:
+                ordered.append(addrs[i])
         var last_err = String("socket.tcp: connect failed")
-        for ip_index in range(len(addrs)):
-            var ip = addrs[ip_index]
+        for ip_index in range(len(ordered)):
+            var ip = ordered[ip_index]
             var family = AF_INET6 if ip.is_v6 else AF_INET
             var rc = sys_socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0)
             if rc < 0:
@@ -104,7 +133,7 @@ struct TcpSocket(Movable):
             var fd = Int32(rc)
             var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
             var alen = write_sockaddr(
-                sa.unsafe_ptr().as_unsafe_any_origin(),
+                sa.unsafe_ptr(),
                 ip.is_v6,
                 ip.octets,
                 port,
@@ -113,7 +142,15 @@ struct TcpSocket(Movable):
             # we set SO_RCVTIMEO/SO_SNDTIMEO BEFORE connect so the
             # syscall itself respects the deadline.
             _apply_timeout(fd, timeout_seconds)
-            var rv = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
+            # connect(2) is interruptible by SIGCHLD/SIGALRM and friends —
+            # the Mojo runtime fires several signals during process startup,
+            # so a fresh-process connect can race against one of them and
+            # return EINTR. Retry transparently like the read/write paths.
+            var rv: Int
+            while True:
+                rv = sys_connect(fd, sa.unsafe_ptr(), Int(alen))
+                if rv != -4:  # not EINTR
+                    break
             if rv == 0:
                 return TcpSocket(fd, ip.is_v6)
             last_err = (
@@ -213,9 +250,7 @@ struct TcpSocket(Movable):
             else:
                 if got == -4:
                     continue
-                raise Error(
-                    "socket.tcp: recv() " + errno_message(Int32(-got))
-                )
+                raise Error("socket.tcp: recv() " + errno_message(Int32(-got)))
         return out^
 
     def write_vectored(
@@ -251,9 +286,7 @@ struct TcpSocket(Movable):
         # uses.
         var sent = sys_writev(self.fd, iov_ptr, n)
         if sent < 0:
-            raise Error(
-                "socket.tcp: writev() " + errno_message(Int32(-sent))
-            )
+            raise Error("socket.tcp: writev() " + errno_message(Int32(-sent)))
         if sent < total:
             var tail = List[UInt8](capacity=total - sent)
             var skip = sent
@@ -283,8 +316,7 @@ struct TcpSocket(Movable):
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(SO_RCVBUF) "
-                + errno_message(Int32(-rv))
+                "socket.tcp: setsockopt(SO_RCVBUF) " + errno_message(Int32(-rv))
             )
 
     def set_send_buffer(mut self, bytes: Int) raises:
@@ -298,8 +330,7 @@ struct TcpSocket(Movable):
         )
         if rv != 0:
             raise Error(
-                "socket.tcp: setsockopt(SO_SNDBUF) "
-                + errno_message(Int32(-rv))
+                "socket.tcp: setsockopt(SO_SNDBUF) " + errno_message(Int32(-rv))
             )
 
     def set_read_timeout(mut self, seconds: Float64) raises:
@@ -397,7 +428,7 @@ struct TcpListener(Movable):
             )
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = write_sockaddr(
-            sa.unsafe_ptr().as_unsafe_any_origin(),
+            sa.unsafe_ptr(),
             addr.ip.is_v6,
             addr.ip.octets,
             addr.port,
@@ -445,7 +476,9 @@ struct TcpListener(Movable):
         kernel-chosen port when bound with port 0)."""
         var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
         var alen = UInt32(SOCKADDR_STORAGE_SIZE)
-        var rv = sys_getsockname(self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen))
+        var rv = sys_getsockname(
+            self.fd, sa.unsafe_ptr(), UnsafePointer(to=alen)
+        )
         if rv != 0:
             _raise("socket.tcp: getsockname(2)", Int32(-rv))
         var is_v6: Bool

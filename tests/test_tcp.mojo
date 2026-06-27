@@ -22,6 +22,32 @@ def run() raises -> Int:
     var got_bytes = sock.read_exact(msg.byte_length())
     var got = String(unsafe_from_utf8=got_bytes)
     f += check(got == msg, "echo round trip: " + got)
+
+    # connect_to_addrs: pre-resolved entry point used by DNS-caching callers.
+    # Build a one-element address list and verify the same echo round trip.
+    var addrs = List[IpAddress]()
+    addrs.append(IpAddress.loopback_v4())
+    var sock2 = TcpSocket.connect_to_addrs(
+        addrs, port, timeout_seconds=2.0
+    )
+    sock2.write(msg.as_bytes())
+    var got2_bytes = sock2.read_exact(msg.byte_length())
+    var got2 = String(unsafe_from_utf8=got2_bytes)
+    f += check(
+        got2 == msg, "connect_to_addrs echo round trip: " + got2
+    )
+
+    # connect_to_addrs raises on an empty address list (EAI_NONAME shape).
+    var raised_empty = False
+    try:
+        var addrs_empty = List[IpAddress]()
+        var _ = TcpSocket.connect_to_addrs(
+            addrs_empty, port, timeout_seconds=2.0
+        )
+    except:
+        raised_empty = True
+    f += check(raised_empty, "connect_to_addrs raises on empty list")
+
     if f == 0:
         print("test_tcp: OK (echoed " + String(msg.byte_length()) + " bytes)")
     return f

@@ -29,17 +29,7 @@ from socket._syscalls import (
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
-from socket.ring import (
-    KIND_ACCEPT_DIRECT,
-    KIND_ACCEPT_MULTI_DIRECT,
-    KIND_CLOSE,
-    KIND_CONNECT,
-    KIND_RECV,
-    KIND_SEND,
-    KIND_SEND_ZC,
-    KIND_SOCKET,
-    Ring,
-)
+from socket.ring import CompletionKind, Ring
 from tests.helpers import check
 
 
@@ -65,9 +55,7 @@ def _listening_socket(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
-    )
+    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring_direct: bind " + errno_message(Int32(-brc)))
@@ -109,7 +97,7 @@ def _test_accept_direct_echo() raises -> Int:
         f += check(Bool(c), "direct: accept/connect completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT_DIRECT:
+        if done.kind == CompletionKind.ACCEPT_DIRECT:
             f += check(done.op == accept_op, "direct: accept op id matches")
             direct_slot = done.res
             var peer = done.accepted_peer()
@@ -119,7 +107,10 @@ def _test_accept_direct_echo() raises -> Int:
             )
             saw_accept = True
         else:
-            f += check(done.kind == KIND_CONNECT, "direct: other op is connect")
+            f += check(
+                done.kind == CompletionKind.CONNECT,
+                "direct: other op is connect",
+            )
             f += check(done.op == connect_op, "direct: connect op id matches")
             saw_connect = True
     f += check(saw_accept and saw_connect, "direct: both ops completed")
@@ -138,7 +129,7 @@ def _test_accept_direct_echo() raises -> Int:
         var c = ring.next_completion()
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV:
+        if done.kind == CompletionKind.RECV:
             echoed = done.take_buffer()
     f += check(len(echoed) == len(payload), "direct: server got full payload")
 
@@ -151,7 +142,7 @@ def _test_accept_direct_echo() raises -> Int:
         var c = ring.next_completion()
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV:
+        if done.kind == CompletionKind.RECV:
             roundtrip = done.take_buffer()
     f += check(len(roundtrip) == len(payload), "direct: client got echo")
     var same = True
@@ -170,7 +161,7 @@ def _test_accept_direct_echo() raises -> Int:
         f += check(Bool(c), "direct: close completion present")
         var done = c.take()
         done.ok()
-        f += check(done.kind == KIND_CLOSE, "direct: close kind")
+        f += check(done.kind == CompletionKind.CLOSE, "direct: close kind")
     f += check(ring.inflight == 0, "direct: drained")
     ring.unregister_files()
     if f == 0:
@@ -202,7 +193,7 @@ def _test_accept_multishot_direct() raises -> Int:
         f += check(Bool(c), "direct-ms: completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT_MULTI_DIRECT:
+        if done.kind == CompletionKind.ACCEPT_MULTI_DIRECT:
             f += check(done.op == ms_accept, "direct-ms: accept op id")
             direct_slots.append(done.res)
             if done.more:
@@ -262,7 +253,7 @@ def _test_socket_direct_connect_and_io() raises -> Int:
             break
         var done = c.take()
         done.ok()
-        if done.kind == KIND_SOCKET:
+        if done.kind == CompletionKind.SOCKET:
             f += check(done.op == sock_op, "sock-direct: op id matches")
             client_slot = done.res
     f += check(client_slot >= 0, "sock-direct: kernel allocated a slot")
@@ -290,7 +281,7 @@ def _test_socket_direct_connect_and_io() raises -> Int:
         var c = ring.next_completion()
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV:
+        if done.kind == CompletionKind.RECV:
             got = done.take_buffer()
     f += check(len(got) == len(msg), "sock-direct: server received full ping")
 
@@ -353,7 +344,7 @@ def _test_send_zc() raises -> Int:
             continue
         var done = c.take()
         done.ok()
-        if done.kind == KIND_SEND_ZC:
+        if done.kind == CompletionKind.SEND_ZC:
             f += check(done.op == send_op, "zc: send_zc op id matches")
             f += check(Int(done.res) == n, "zc: send_zc reported all bytes")
             send_done = True

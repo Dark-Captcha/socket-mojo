@@ -58,7 +58,10 @@ comptime _PROT_RW = PROT_READ | PROT_WRITE
 comptime _OFF_SQ_RING = 0
 comptime _OFF_SQES = 0x10000000
 
-# Opcodes (include/uapi/linux/io_uring.h).
+# Opcodes (include/uapi/linux/io_uring.h). Kept as bare UInt8
+# comptime constants because the kernel writes them into one byte of
+# the SQE; there's no dispatch logic in this layer (ring.mojo above
+# carries the typed CompletionKind, which is the user-facing tag).
 comptime OP_NOP = UInt8(0)
 comptime OP_TIMEOUT = UInt8(11)
 comptime OP_ACCEPT = UInt8(13)
@@ -180,9 +183,7 @@ struct UringQueue(Movable):
         if sqpoll:
             # params.sq_thread_idle @ byte 16
             (params.unsafe_ptr() + 16).bitcast[UInt32]()[0] = sqpoll_idle_ms
-        var rc = syscall(
-            SYS_IO_URING_SETUP, entries, Int(params.unsafe_ptr())
-        )
+        var rc = syscall(SYS_IO_URING_SETUP, entries, Int(params.unsafe_ptr()))
         if rc < 0:
             raise Error(
                 "socket.uring: io_uring_setup failed (errno "

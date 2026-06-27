@@ -23,7 +23,10 @@ async def conn_worker(reader, writer, msg, rounds):
 
 async def main():
     if len(sys.argv) < 5:
-        print("usage: client.py <port> <conns> <rounds> <payload>", file=sys.stderr)
+        print(
+            "usage: client.py <port> <conns> <rounds> <payload>",
+            file=sys.stderr,
+        )
         sys.exit(2)
     port = int(sys.argv[1])
     conns = int(sys.argv[2])
@@ -38,13 +41,13 @@ async def main():
         pairs.append((r, w))
 
     t0 = time.perf_counter()
-    await asyncio.gather(
-        *(conn_worker(r, w, msg, rounds) for r, w in pairs)
-    )
+    await asyncio.gather(*(conn_worker(r, w, msg, rounds) for r, w in pairs))
     elapsed = time.perf_counter() - t0
 
     rate = (rounds * conns) / elapsed
-    print(f"py: {conns} conns x {rounds} rounds @ {payload} B → {int(rate)} rt/s")
+    print(
+        f"py: {conns} conns x {rounds} rounds @ {payload} B → {int(rate)} rt/s"
+    )
 
     for _, w in pairs:
         w.close()

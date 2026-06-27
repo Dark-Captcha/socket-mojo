@@ -58,6 +58,7 @@ comptime ECANCELED = 125
 
 # --- predicates -----------------------------------------------------
 
+
 def _has_tag(e: Error, tag: String) -> Bool:
     return String(e).find(tag) >= 0
 
@@ -131,6 +132,7 @@ def is_dns_error(e: Error) -> Bool:
 
 # --- general extraction ---------------------------------------------
 
+
 def errno_of(e: Error) -> Int32:
     """Best-effort errno extraction. Returns the matching numeric
     code for a named tag (`ECONNREFUSED` → 111), or parses the
@@ -192,7 +194,9 @@ def errno_of(e: Error) -> Int32:
     var pos = msg.find(marker)
     if pos < 0:
         return Int32(0)
-    var rest = String(msg[byte = pos + marker.byte_length() : msg.byte_length()])
+    var rest = String(
+        msg[byte = pos + marker.byte_length() : msg.byte_length()]
+    )
     var rest_bytes = rest.as_bytes()
     var end = 0
     while end < len(rest_bytes):

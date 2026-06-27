@@ -128,6 +128,21 @@ def _test_parser_negatives() raises -> Int:
     except:
         caught = True
     f += check(caught, "dns: pointer loop rejected")
+
+    # ANCOUNT DoS guard: a malicious server claiming 65535 answers is
+    # rejected before the parser starts walking name compression for
+    # each record.
+    caught = False
+    try:
+        var dos = List[UInt8](length=12, fill=0)
+        dos[2] = 0x80  # QR=1
+        dos[5] = 0x01  # QDCOUNT=1
+        dos[6] = 0xFF
+        dos[7] = 0xFF  # ANCOUNT=65535
+        _ = dns_parse_response(Span(dos), UInt16(0), QTYPE_A, String("x"))
+    except:
+        caught = True
+    f += check(caught, "dns: ANCOUNT DoS cap")
     if f == 0:
         print("  wire codec negatives: OK")
     return f

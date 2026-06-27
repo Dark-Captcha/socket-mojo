@@ -67,11 +67,9 @@ struct PollEvent(Copyable, ImplicitlyCopyable, Movable):
         return (self.raw_events & UInt32(EPOLLRDHUP)) != 0
 
 
-def _write_event(
-    out_ptr: UnsafePointer[UInt8, MutAnyOrigin],
-    events: UInt32,
-    fd: Int32,
-):
+def _write_event[
+    O: Origin[mut=True]
+](out_ptr: UnsafePointer[UInt8, O], events: UInt32, fd: Int32):
     """Serialize a `struct epoll_event` (packed on x86-64): u32
     events at offset 0, then the data union (u64) at offset 4. We
     stash the fd in the low 32 bits of data so the wait loop can
@@ -149,12 +147,10 @@ struct Poller(Movable):
         if oneshot:
             events |= UInt32(EPOLLONESHOT)
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
-        _write_event(ev.unsafe_ptr().as_unsafe_any_origin(), events, fd)
+        _write_event(ev.unsafe_ptr(), events, fd)
         var rv = sys_epoll_ctl(self.epfd, op, fd, ev.unsafe_ptr())
         if rv != 0:
-            raise Error(
-                "socket.poller: epoll_ctl " + errno_message(Int32(-rv))
-            )
+            raise Error("socket.poller: epoll_ctl " + errno_message(Int32(-rv)))
 
     def register(
         mut self,
@@ -205,13 +201,10 @@ struct Poller(Movable):
         # epoll_ctl(EPOLL_CTL_DEL) ignores the event argument; pass a
         # zeroed buffer.
         var ev = InlineArray[UInt8, EPOLL_EVENT_SIZE](fill=0)
-        var rv = sys_epoll_ctl(
-            self.epfd, EPOLL_CTL_DEL, fd, ev.unsafe_ptr()
-        )
+        var rv = sys_epoll_ctl(self.epfd, EPOLL_CTL_DEL, fd, ev.unsafe_ptr())
         if rv != 0:
             raise Error(
-                "socket.poller: epoll_ctl(DEL) "
-                + errno_message(Int32(-rv))
+                "socket.poller: epoll_ctl(DEL) " + errno_message(Int32(-rv))
             )
 
     def wait(

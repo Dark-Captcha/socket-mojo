@@ -18,6 +18,11 @@ comptime QTYPE_AAAA = UInt16(28)
 
 comptime _CLASS_IN = UInt16(1)
 comptime _MAX_NAME_HOPS = 32  # compression-pointer loop bound
+# A spoofed server could put 65535 in ANCOUNT and waste tens of MB
+# of name-decompression work per packet. Real responses for A/AAAA
+# rarely exceed a dozen RRs even for fan-out CDNs; 256 is a generous
+# ceiling that still rejects DoS-shaped inputs early.
+comptime _MAX_ANSWERS = 256
 
 
 struct DnsAnswer(Copyable, Movable):
@@ -130,7 +135,10 @@ def _lower_ascii(s: String) -> String:
 
 
 def dns_parse_response(
-    msg: Span[UInt8, _], expect_txid: UInt16, qtype: UInt16, expect_qname: String
+    msg: Span[UInt8, _],
+    expect_txid: UInt16,
+    qtype: UInt16,
+    expect_qname: String,
 ) raises -> DnsAnswer:
     """Validates the header against the query and walks the answer
     section, following CNAMEs within the message. Raises on malformed
@@ -151,6 +159,11 @@ def dns_parse_response(
     var ancount = (UInt16(msg[6]) << 8) | UInt16(msg[7])
     if qdcount != 1:
         raise Error("socket.dnswire: unexpected question count")
+    # DoS guard: cap ANCOUNT before the answer-walk loop. A malicious
+    # server could otherwise drive 65535 iterations of compressed-name
+    # parsing per packet.
+    if Int(ancount) > _MAX_ANSWERS:
+        raise Error("socket.dnswire: answer count exceeds policy cap")
     # question: capture the canonical qname, verify it echoes the queried
     # host, and verify the qtype/qclass echo
     var q = _read_name(msg, 12)

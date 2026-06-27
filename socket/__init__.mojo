@@ -20,3 +20,52 @@
 #   socket/uring_sys.mojo io_uring raw layer (mmap'd rings, SQEs/CQEs)
 #   socket/bufring.mojo   provided-buffer rings (multishot recv pool)
 #   socket/ring.mojo      Ring: safe completion engine — THE CORE
+
+
+# --- value types ---------------------------------------------------
+from socket.addr import (
+    IpAddress,
+    SocketAddr,
+    parse_ip,
+    parse_ipv4,
+    parse_ipv6,
+)
+
+# --- blocking sockets ---------------------------------------------
+from socket.tcp import TcpListener, TcpSocket
+from socket.udp import UdpSocket
+
+# --- DNS ----------------------------------------------------------
+from socket.dns import resolve, resolve_dns
+from socket.dnswire import (
+    DnsAnswer,
+    QTYPE_A,
+    QTYPE_AAAA,
+    QTYPE_CNAME,
+    dns_build_query,
+    dns_parse_response,
+)
+
+# --- epoll reactor ------------------------------------------------
+from socket.nonblocking import set_nonblocking
+from socket.poller import PollEvent, Poller
+
+# --- io_uring engine ----------------------------------------------
+from socket.ring import Completion, CompletionKind, OpId, Ring
+
+# --- typed-error predicates ---------------------------------------
+from socket.errors import (
+    errno_of,
+    is_address_in_use,
+    is_bad_fd,
+    is_broken_pipe,
+    is_canceled,
+    is_connection_aborted,
+    is_connection_refused,
+    is_connection_reset,
+    is_dns_error,
+    is_host_unreachable,
+    is_in_progress,
+    is_timed_out,
+    is_would_block,
+)

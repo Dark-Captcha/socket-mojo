@@ -23,22 +23,7 @@ from socket._syscalls import (
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
-from socket.ring import (
-    KIND_ACCEPT,
-    KIND_ACCEPT_MULTI,
-    KIND_CANCEL,
-    KIND_CLOSE,
-    KIND_CONNECT,
-    KIND_MSG_INCOMING,
-    KIND_MSG_RING,
-    KIND_NOP,
-    KIND_RECV,
-    KIND_RECV_MULTI,
-    KIND_SEND,
-    KIND_TIMEOUT,
-    Completion,
-    Ring,
-)
+from socket.ring import Completion, CompletionKind, Ring
 from std.memory import UnsafePointer
 
 from tests.helpers import check
@@ -66,9 +51,7 @@ def _listening_socket(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
-    )
+    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
     var brc = sys_bind(fd, sa.unsafe_ptr(), Int(alen))
     if brc != 0:
         raise Error("test_ring: bind() " + errno_message(Int32(-brc)))
@@ -92,7 +75,7 @@ def _test_nop_batch() raises -> Int:
             break
         var done = c.take()
         done.ok()
-        f += check(done.kind == KIND_NOP, "ring: nop kind")
+        f += check(done.kind == CompletionKind.NOP, "ring: nop kind")
         seen += 1
     f += check(seen == 10, "ring: all 10 nops completed")
     f += check(ring.inflight == 0, "ring: nothing left inflight")
@@ -119,7 +102,7 @@ def _test_loopback_echo() raises -> Int:
         f += check(Bool(c), "ring: accept/connect completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT:
+        if done.kind == CompletionKind.ACCEPT:
             f += check(done.op == accept_op, "ring: accept op id matches")
             afd = done.res
             var peer = done.accepted_peer()
@@ -128,7 +111,9 @@ def _test_loopback_echo() raises -> Int:
                 "ring: accepted peer is loopback with a real port",
             )
         else:
-            f += check(done.kind == KIND_CONNECT, "ring: other op is connect")
+            f += check(
+                done.kind == CompletionKind.CONNECT, "ring: other op is connect"
+            )
             f += check(done.op == connect_op, "ring: connect op id matches")
     f += check(afd > 0, "ring: accepted fd valid")
 
@@ -145,7 +130,7 @@ def _test_loopback_echo() raises -> Int:
         f += check(Bool(c), "ring: send/recv completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV:
+        if done.kind == CompletionKind.RECV:
             f += check(done.op == srv_recv, "ring: recv op id matches")
             echoed = done.take_buffer()
     f += check(len(echoed) == len(payload), "ring: server got full payload")
@@ -159,7 +144,7 @@ def _test_loopback_echo() raises -> Int:
         var c = ring.next_completion()
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV:
+        if done.kind == CompletionKind.RECV:
             f += check(done.op == cli_recv, "ring: client recv op id matches")
             round = done.take_buffer()
     f += check(len(round) == len(payload), "ring: round-trip length")
@@ -179,7 +164,7 @@ def _test_loopback_echo() raises -> Int:
         f += check(Bool(c), "ring: close completion present")
         var done = c.take()
         done.ok()
-        f += check(done.kind == KIND_CLOSE, "ring: close kind")
+        f += check(done.kind == CompletionKind.CLOSE, "ring: close kind")
     f += check(ring.inflight == 0, "ring: drained")
     if f == 0:
         print("  loopback echo: OK")
@@ -254,7 +239,7 @@ def _test_multishot_and_buffers() raises -> Int:
         f += check(Bool(c), "m1: completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT_MULTI:
+        if done.kind == CompletionKind.ACCEPT_MULTI:
             f += check(done.op == ms_accept, "m1: multishot accept op id")
             accepted.append(done.res)
             if done.more:
@@ -278,7 +263,7 @@ def _test_multishot_and_buffers() raises -> Int:
         f += check(Bool(c), "m1: send/recv completion present")
         var done = c.take()
         done.ok()
-        if done.kind == KIND_RECV_MULTI:
+        if done.kind == CompletionKind.RECV_MULTI:
             f += check(done.op == ms_recv, "m1: multishot recv op id")
             f += check(done.bid >= 0, "m1: kernel picked a buffer")
             f += check(done.more, "m1: recv stays armed")
@@ -301,12 +286,12 @@ def _test_multishot_and_buffers() raises -> Int:
     for _ in range(2):
         var c = ring.next_completion()
         var done = c.take()
-        if done.kind == KIND_RECV_MULTI:
+        if done.kind == CompletionKind.RECV_MULTI:
             f += check(done.res == -125, "m1: canceled recv res ECANCELED")
             f += check(not done.more, "m1: terminal completion")
             canceled = True
         else:
-            f += check(done.kind == KIND_CANCEL, "m1: cancel ack")
+            f += check(done.kind == CompletionKind.CANCEL, "m1: cancel ack")
             done.ok()
     f += check(canceled, "m1: multishot recv canceled")
 
@@ -341,7 +326,7 @@ def _test_timers() raises -> Int:
     _ = ring.wait(min_complete=1)
     var c = ring.next_completion()
     var done = c.take()
-    f += check(done.kind == KIND_TIMEOUT, "m1: timeout kind")
+    f += check(done.kind == CompletionKind.TIMEOUT, "m1: timeout kind")
     f += check(done.res == -62, "m1: timer fired ETIME")
 
     # recv deadline on a silent connection
@@ -366,7 +351,9 @@ def _test_timers() raises -> Int:
     _ = ring.wait(min_complete=2)
     var cc = ring.next_completion()
     var dd = cc.take()
-    f += check(dd.kind == KIND_RECV, "m1: recv-with-timeout user kind")
+    f += check(
+        dd.kind == CompletionKind.RECV, "m1: recv-with-timeout user kind"
+    )
     f += check(dd.res == -125, "m1: recv deadline ECANCELED")
     f += check(
         Bool(not ring.next_completion()),
@@ -398,13 +385,15 @@ def _test_msg_ring() raises -> Int:
     var ca = a.next_completion()
     var ack = ca.take()
     ack.ok()
-    f += check(ack.kind == KIND_MSG_RING, "msg-ring: local ack kind")
+    f += check(ack.kind == CompletionKind.MSG_RING, "msg-ring: local ack kind")
     f += check(ack.op == op, "msg-ring: ack op id")
     # Now reap the message on the target ring.
     _ = b.wait(min_complete=1)
     var cb = b.next_completion()
     var incoming = cb.take()
-    f += check(incoming.kind == KIND_MSG_INCOMING, "msg-ring: target kind")
+    f += check(
+        incoming.kind == CompletionKind.MSG_INCOMING, "msg-ring: target kind"
+    )
     f += check(
         Int(incoming.res) == 0x4242,
         "msg-ring: target carried `res` payload",

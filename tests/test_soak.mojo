@@ -29,7 +29,7 @@ from socket._syscalls import (
     write_sockaddr,
 )
 from socket.addr import IpAddress, SocketAddr
-from socket.ring import KIND_ACCEPT, KIND_CONNECT, KIND_RECV, KIND_SEND, Ring
+from socket.ring import CompletionKind, Ring
 
 
 def _fresh_socket() raises -> Int32:
@@ -51,9 +51,7 @@ def _listen_on(port: UInt16) raises -> Int32:
     )
     var sa = InlineArray[UInt8, SOCKADDR_STORAGE_SIZE](fill=0)
     var ip = IpAddress.v4(127, 0, 0, 1)
-    var alen = write_sockaddr(
-        sa.unsafe_ptr().as_unsafe_any_origin(), False, ip.octets, port
-    )
+    var alen = write_sockaddr(sa.unsafe_ptr(), False, ip.octets, port)
     if sys_bind(lfd, sa.unsafe_ptr(), Int(alen)) != 0:
         raise Error("soak: bind")
     if sys_listen(lfd, 8) != 0:
@@ -123,7 +121,7 @@ def _soak_echo() raises:
         var c = ring.next_completion()
         var done = c.take()
         done.ok()
-        if done.kind == KIND_ACCEPT:
+        if done.kind == CompletionKind.ACCEPT:
             afd = done.res
     _check(afd > 0, "accept failed in setup")
 
@@ -143,14 +141,12 @@ def _soak_echo() raises:
             var c = ring.next_completion()
             var done = c.take()
             done.ok()
-            if done.kind == KIND_SEND:
+            if done.kind == CompletionKind.SEND:
                 saw_send = True
-            elif done.kind == KIND_RECV:
+            elif done.kind == CompletionKind.RECV:
                 saw_recv = True
                 _check(Int(done.res) == msg_len, "recv length mismatch")
-        _check(
-            saw_send and saw_recv, "missing send/recv completion"
-        )
+        _check(saw_send and saw_recv, "missing send/recv completion")
         _check(ring.inflight == 0, "inflight nonzero between rounds")
         if (i + 1) % 25_000 == 0:
             print(

@@ -34,9 +34,7 @@ def run() raises -> Int:
     f += check(any_loopback, "localhost includes a loopback IP")
 
     if f == 0:
-        print(
-            "test_dns: OK (" + String(len(local)) + " answers for localhost)"
-        )
+        print("test_dns: OK (" + String(len(local)) + " answers for localhost)")
     return f
 
 
